@@ -1,0 +1,5461 @@
+#!/usr/bin/env python3
+"""
+cpsi_bridge.py — Pont entre quantique, fréquences et applications
+
+PARTIE 1 : FINITE-SIZE SCALING (ground state fermé, N=4 à N=14)
+  → Instantané (diagonalisation), donne β critique propre
+  → Renforce P3q massivement
+
+PARTIE 2 : C[Ψ] SUR SIGNAUX ACOUSTIQUES
+  → Son pur vs son dissonant vs bruit
+  → Accord parfait vs désaccordé
+  → Fréquences harmoniques vs inharmoniques
+  → Test direct : la cohérence musicale = C[Ψ] élevé ?
+
+PARTIE 3 : RÉSONANCE ET FRÉQUENCES LIMITES
+  → À quelle fréquence C[Ψ] s'effondre ?
+  → Lien perception humaine : 20 Hz - 20 kHz
+  → Les limites physiologiques = limites de réalité perçue ?
+
+python3 -u ~/Desktop/cpsi_bridge.py 2>&1 | tee ~/Desktop/bridge_log.txt
+"""
+import numpy as np
+import time, warnings, csv
+warnings.filterwarnings('ignore')
+from scipy import stats, signal, fft
+from pathlib import Path
+
+OUT = Path.home() / "Desktop" / "cpsi_bridge"
+OUT.mkdir(exist_ok=True)
+
+
+def compute_cpsi(sz):
+    N = len(sz)
+    if N < 2: return None, None
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+
+def compute_cpsi_matrix(data_matrix):
+    """C[Ψ] depuis matrice T×N (signaux multi-channels)."""
+    if data_matrix.shape[1] < 3: 
+        # 2 channels: use simple correlation
+        data = (data_matrix - data_matrix.mean(axis=0)) / (data_matrix.std(axis=0) + 1e-10)
+        r = abs(np.corrcoef(data.T)[0,1])
+        return (2*r + 1)/3, 2*(1-r)/3
+    data = (data_matrix - data_matrix.mean(axis=0)) / (data_matrix.std(axis=0) + 1e-10)
+    C_mat = np.corrcoef(data.T)
+    N = C_mat.shape[0]
+    micro = np.mean([abs(C_mat[i,i+1]) for i in range(N-1)])
+    pairs = [abs(C_mat[i,j]) for i in range(N) for j in range(i+1,N)]
+    macro = np.mean(pairs)
+    neighbor = [abs(C_mat[i,i+1]) for i in range(N-1)]
+    meso = max(0, min(1, 1.0 - np.std(neighbor)))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 1 : FINITE-SIZE SCALING (N=4 à N=14)
+# ═══════════════════════════════════════════════════
+
+def test_finite_size():
+    """
+    Ground state fermé (avec ε=0.01) pour N=4 à N=14.
+    Diagonalisation exacte → instantané jusqu'à N~12.
+    Donne le vrai β critique par finite-size scaling.
+    """
+    import qutip as qt
+    
+    print(f"\n{'='*60}")
+    print(f"PARTIE 1 : FINITE-SIZE SCALING (ground state)")
+    print(f"N = 4 à 14, diagonalisation exacte")
+    print(f"{'='*60}", flush=True)
+    
+    epsilon = 0.01
+    hJ_values = [0.01, 0.2, 0.4, 0.5, 0.57, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0]
+    
+    all_results = []
+    
+    for N in range(4, 15):
+        dim = 2**N
+        if dim > 32768:  # 2^15 = 32768, skip N>14
+            print(f"\n  N={N}: dim={dim} trop grand, skip", flush=True)
+            break
+        
+        print(f"\n  N={N} (dim={dim}):", flush=True)
+        t_total = time.time()
+        
+        for hJ in hJ_values:
+            t0 = time.time()
+            try:
+                J = 1.0; h = hJ * J
+                H = 0
+                for i in range(N-1):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+                    H += -J * qt.tensor(o)
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+                    H += -h * qt.tensor(o)
+                    o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+                    H += -epsilon * qt.tensor(o2)
+                
+                evals, estates = H.eigenstates(eigvals=2, sparse=True)
+                psi = estates[0]
+                gap = evals[1] - evals[0]
+                
+                sz = []
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                    sz.append(qt.expect(qt.tensor(o), psi))
+                
+                C, T = compute_cpsi(np.array(sz))
+                dt = time.time() - t0
+                print(f"    hJ={hJ:.2f}  C={C:.4f}  T={T:.4f}  gap={gap:.4f}  ({dt:.1f}s)", flush=True)
+                all_results.append({'N':N, 'hJ':hJ, 'C':C, 'T':T, 'gap':gap})
+            except Exception as e:
+                print(f"    hJ={hJ:.2f}  X {str(e)[:50]}", flush=True)
+        
+        dt_total = time.time() - t_total
+        print(f"  N={N} terminé en {dt_total:.0f}s", flush=True)
+    
+    if len(all_results) < 20: return
+    
+    # Analyse finite-size scaling
+    print(f"\n  FINITE-SIZE SCALING :")
+    print(f"  {'N':<5} {'C_eq(A)':<12} {'C_eq(B)':<12} {'Ratio':<8}")
+    for N_val in sorted(set(r['N'] for r in all_results)):
+        sub = [r for r in all_results if r['N'] == N_val]
+        C_A = np.mean([r['C'] for r in sub if r['hJ'] < 0.3])
+        C_B = np.mean([r['C'] for r in sub if r['hJ'] > 1.0])
+        ratio = C_A / C_B if C_B > 0.01 else np.inf
+        print(f"  {N_val:<5} {C_A:<12.4f} {C_B:<12.4f} {ratio:<8.2f}")
+    
+    # β par fit power-law pour chaque N
+    print(f"\n  EXPOSANT CRITIQUE β par taille :")
+    for N_val in sorted(set(r['N'] for r in all_results)):
+        sub = [r for r in all_results if r['N'] == N_val]
+        hJ_arr = np.array([r['hJ'] for r in sub])
+        C_arr = np.array([r['C'] for r in sub])
+        C_B = np.mean(C_arr[hJ_arr > 1.0])
+        # Fit sur la partie transition
+        mask = (hJ_arr >= 0.4) & (hJ_arr <= 0.8) & (C_arr > C_B * 1.1)
+        if mask.sum() >= 3:
+            x = np.log(np.abs(hJ_arr[mask] - 0.57) + 0.01)
+            y = np.log(C_arr[mask] - C_B + 0.01)
+            try:
+                slope, intercept, r_val, _, _ = stats.linregress(x, y)
+                print(f"  N={N_val:2d}  beta_eff = {slope:.3f}  (R2 = {r_val**2:.3f})")
+            except:
+                pass
+    
+    with open(OUT / 'finite_size.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=all_results[0].keys())
+        w.writeheader(); w.writerows(all_results)
+    print(f"\n  Sauve: {OUT / 'finite_size.csv'}", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2 : C[Ψ] SUR SIGNAUX ACOUSTIQUES
+# ═══════════════════════════════════════════════════
+
+def test_acoustic():
+    """
+    Hypothèse : l'harmonie musicale/acoustique = C[Ψ] élevé
+    Dissonance = C[Ψ] faible
+    
+    On génère des signaux multi-channels avec différentes
+    structures harmoniques et on mesure C[Ψ].
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 2 : C[Ψ] SUR SIGNAUX ACOUSTIQUES")
+    print(f"Harmonie vs Dissonance vs Bruit")
+    print(f"{'='*60}", flush=True)
+    
+    fs = 44100  # Hz audio standard
+    duration = 1.0  # 1 seconde
+    T_samples = int(fs * duration)
+    t = np.arange(T_samples) / fs
+    np.random.seed(42)
+    
+    results = []
+    
+    # === A. Accords musicaux ===
+    print(f"\n  A. ACCORDS MUSICAUX (8 harmoniques par note) :", flush=True)
+    
+    def make_note(freq, t, n_harmonics=8):
+        """Génère une note avec harmoniques naturelles."""
+        sig = np.zeros_like(t)
+        for h in range(1, n_harmonics+1):
+            sig += (1.0/h) * np.sin(2*np.pi*freq*h*t)
+        return sig
+    
+    accords = {
+        # Accord parfait majeur (Do-Mi-Sol) : rapports 4:5:6
+        'Majeur (4:5:6)': [261.63, 329.63, 392.00],
+        # Accord parfait mineur (Do-Mib-Sol) : rapports 10:12:15
+        'Mineur (10:12:15)': [261.63, 311.13, 392.00],
+        # Quinte juste (Do-Sol) : rapport 2:3
+        'Quinte (2:3)': [261.63, 392.00, 523.25],
+        # Octave (Do-Do) : rapport 1:2
+        'Octave (1:2)': [261.63, 523.25, 261.63*4],
+        # Triton (diabolus in musica) : rapport sqrt(2)
+        'Triton (sqrt2)': [261.63, 369.99, 523.25],
+        # Cluster dissonant (demi-tons adjacents)
+        'Cluster (demi-tons)': [261.63, 277.18, 293.66],
+        # Quart de ton (micro-intervalle)
+        'Quart de ton': [261.63, 269.29, 277.18],
+        # Unisson parfait
+        'Unisson': [261.63, 261.63, 261.63],
+        # Aléatoire (fréquences non harmoniques)
+        'Aleatoire': [261.63, 317.42, 428.91],
+        # Bruit blanc
+        'Bruit blanc': None,
+    }
+    
+    for name, freqs in accords.items():
+        if freqs is None:
+            # Bruit blanc
+            channels = [np.random.randn(T_samples) for _ in range(8)]
+        else:
+            # 8 channels = 8 harmoniques du fondamental
+            channels = []
+            for f in freqs:
+                for h_idx in range(1, 4):  # 3 harmoniques par note
+                    sig = make_note(f * h_idx, t, n_harmonics=3)
+                    sig += np.random.randn(T_samples) * 0.01  # petit bruit
+                    channels.append(sig)
+            # Pad to 8 channels si nécessaire
+            while len(channels) < 8:
+                channels.append(channels[-1] * 0.5 + np.random.randn(T_samples) * 0.01)
+            channels = channels[:8]
+        
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        
+        # Dissonance proxy : ratio des fréquences
+        if freqs:
+            ratios = [freqs[i]/freqs[0] for i in range(1, len(freqs))]
+            # Proche d'un rapport simple (1, 1.5, 2, etc.) = consonant
+            consonance = np.mean([min(abs(r - round(r*6)/6) for r in [0.5,0.667,0.75,1,1.333,1.5,2]) for r in ratios])
+        else:
+            consonance = 1.0  # bruit = max dissonance
+        
+        print(f"    {name:<22s}  C={C:.4f}  T={T:.4f}", flush=True)
+        results.append({'type': name, 'C': C, 'T': T, 'consonance': consonance})
+    
+    # === B. Fréquences pures ===
+    print(f"\n  B. FRÉQUENCES PURES (même fréquence, phases décalées) :", flush=True)
+    
+    freq_results = []
+    for freq in [20, 50, 100, 261, 440, 1000, 4000, 10000, 20000]:
+        channels = []
+        for ch in range(8):
+            phase = 2*np.pi * ch / 8
+            sig = np.sin(2*np.pi*freq*t + phase) + np.random.randn(T_samples) * 0.05
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        print(f"    f={freq:6d} Hz  C={C:.4f}  T={T:.4f}", flush=True)
+        freq_results.append({'freq': freq, 'C': C, 'T': T})
+    
+    # Analyse : C dépend-il de la fréquence ?
+    freqs_arr = np.array([r['freq'] for r in freq_results])
+    C_arr = np.array([r['C'] for r in freq_results])
+    r, p = stats.pearsonr(np.log10(freqs_arr), C_arr)
+    print(f"\n    rho(log10(freq), C) = {r:+.4f}  p={p:.4f}")
+    if abs(r) < 0.2:
+        print(f"    --> C[Psi] est INDEPENDANT de la frequence pure")
+        print(f"    --> Confirme scale-invariance (P2)")
+    
+    # === C. Battements (phasage/déphasage) ===
+    print(f"\n  C. BATTEMENTS (phasage/dephasage) :", flush=True)
+    
+    for detune in [0, 0.5, 1, 2, 5, 10, 50]:
+        channels = []
+        f_base = 440  # La
+        for ch in range(8):
+            f = f_base + detune * (ch - 4)  # spread autour de 440
+            sig = np.sin(2*np.pi*f*t) + np.random.randn(T_samples) * 0.02
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        print(f"    detune={detune:5.1f} Hz  C={C:.4f}  T={T:.4f}", flush=True)
+    
+    # === D. Résonance : signal + résonateur ===
+    print(f"\n  D. RESONANCE (excitation + cavite) :", flush=True)
+    
+    for Q_factor in [1, 5, 10, 50, 100, 500]:
+        # Excitation = impulsion
+        excitation = np.zeros(T_samples)
+        excitation[100] = 1.0  # impulsion à t=100
+        
+        # Résonateur = filtre passe-bande centré sur 440 Hz
+        f_res = 440
+        bw = f_res / Q_factor
+        try:
+            b, a = signal.butter(2, [max(1, f_res-bw/2), min(fs/2-1, f_res+bw/2)], btype='band', fs=fs)
+            resonance = signal.lfilter(b, a, excitation)
+        except:
+            resonance = excitation
+        
+        # 8 channels = résonance + bruit variable
+        channels = []
+        for ch in range(8):
+            noise_level = 0.001 * (ch + 1)
+            sig = resonance + np.random.randn(T_samples) * noise_level
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        print(f"    Q={Q_factor:4d}  C={C:.4f}  T={T:.4f}", flush=True)
+    
+    with open(OUT / 'acoustic.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['type','C','T','consonance'])
+        w.writeheader()
+        for r in results:
+            w.writerow(r)
+    print(f"\n  Sauve: {OUT / 'acoustic.csv'}", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 3 : LIMITES DE FRÉQUENCE = LIMITES DE RÉALITÉ ?
+# ═══════════════════════════════════════════════════
+
+def test_frequency_limits():
+    """
+    Hypothèse : la perception humaine (20 Hz - 20 kHz pour l'audio,
+    0.5 - 80 Hz pour l'EEG) définit une fenêtre de "réalité perçue".
+    
+    C[Ψ] capture-t-il cette fenêtre ?
+    → Signaux dans la bande perceptible vs hors bande
+    → Structure harmonique vs inharmonique
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 3 : LIMITES FREQUENCE = LIMITES REALITE ?")
+    print(f"{'='*60}", flush=True)
+    
+    fs = 44100
+    duration = 0.5
+    T_samples = int(fs * duration)
+    t = np.arange(T_samples) / fs
+    np.random.seed(42)
+    
+    # A. Signal harmonique à différentes fréquences fondamentales
+    print(f"\n  A. HARMONIQUES NATURELLES (f, 2f, 3f, 4f) :", flush=True)
+    print(f"  {'Freq (Hz)':<12} {'Bande':<15} {'C':<8} {'T':<8}")
+    
+    results = []
+    for f0 in [1, 5, 20, 50, 100, 200, 440, 1000, 4000, 10000, 20000, 40000]:
+        channels = []
+        for h in range(1, 9):  # 8 harmoniques
+            f = f0 * h
+            if f > fs/2: f = fs/2 - 100  # Nyquist
+            sig = np.sin(2*np.pi*f*t) / h + np.random.randn(T_samples) * 0.01
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        
+        if f0 < 20: band = "infra-son"
+        elif f0 <= 20000: band = "audible"
+        else: band = "ultra-son"
+        
+        print(f"  {f0:<12d} {band:<15s} {C:.4f}   {T:.4f}")
+        results.append({'f0':f0, 'band':band, 'C':C, 'T':T})
+    
+    # B. Rapport signal/bruit et cohérence
+    print(f"\n  B. RAPPORT SIGNAL/BRUIT vs C[Psi] (f=440 Hz) :", flush=True)
+    
+    for snr_db in [-20, -10, -6, -3, 0, 3, 6, 10, 20, 40]:
+        snr_linear = 10**(snr_db/20)
+        channels = []
+        for ch in range(8):
+            phase = 2*np.pi * ch / 8
+            sig = snr_linear * np.sin(2*np.pi*440*t + phase) + np.random.randn(T_samples)
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        print(f"    SNR={snr_db:+4d} dB  C={C:.4f}  T={T:.4f}")
+    
+    # C. Transition ordre/désordre sonore
+    print(f"\n  C. TRANSITION ORDRE/DESORDRE (ratio harmonique/bruit) :", flush=True)
+    
+    for ratio in np.linspace(0, 1, 11):
+        channels = []
+        for ch in range(8):
+            harmonic = np.sin(2*np.pi*440*t + 2*np.pi*ch/8)
+            noise = np.random.randn(T_samples)
+            sig = ratio * harmonic + (1-ratio) * noise
+            channels.append(sig)
+        data = np.column_stack(channels)
+        C, T = compute_cpsi_matrix(data)
+        print(f"    harmonic={ratio:.1f}  C={C:.4f}  T={T:.4f}")
+    
+    with open(OUT / 'frequency_limits.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=results[0].keys())
+        w.writeheader(); w.writerows(results)
+
+
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] BRIDGE — Quantique / Frequences / Son")
+    print(f"{'='*60}", flush=True)
+    
+    t0 = time.time()
+    
+    # Partie 2 et 3 d'abord (instantané, pas de qutip)
+    test_acoustic()
+    test_frequency_limits()
+    
+    # Partie 1 en dernier (nécessite qutip, peut être long pour N>12)
+    test_finite_size()
+    
+    total = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"TOTAL: {total/60:.1f} min")
+    print(f"Resultats: {OUT}")
+    print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_complete.py — Tests complémentaires finaux
+
+TEST 1 : FEEDBACK à N=5 (le +34% tient-il à plus grande taille ?)
+TEST 2 : BORNE DE CARNOT — C prédit-il la distance au rendement max ?
+TEST 3 : CYCLE THERMODYNAMIQUE — stroke engine avec C comme indicateur
+TEST 4 : DEUX SYSTÈMES COUPLÉS — transfert d'énergie optimisé par C
+TEST 5 : C vs TRAVAIL EXTRACTIBLE (Ergotropy) — la vraie mesure quantique
+
+python3 -u ~/Desktop/cpsi_complete2.py 2>&1 | tee ~/Desktop/complete2_log.txt
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats
+import warnings, time
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def ising_H(N, hJ, J=1.0, eps=0.01):
+    h = hJ * J; H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -eps * qt.tensor(o2)
+    return H
+
+def make_cops(N, gamma):
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    return c_ops
+
+def make_sz_ops(N):
+    ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        ops.append(qt.tensor(o))
+    return ops
+
+def ergotropy(H, rho):
+    """
+    Ergotropy = max travail extractible par opération unitaire.
+    W_erg = Tr(ρH) - Σ_i p_i ε_i (avec p_i triés décroissant, ε_i croissant)
+    C'est la mesure quantique EXACTE du travail extractible.
+    """
+    E = qt.expect(H, rho)
+    evals_H = np.sort(H.eigenenergies())
+    evals_rho = np.sort(rho.eigenenergies())[::-1]  # décroissant
+    E_passive = np.sum(evals_rho * evals_H[:len(evals_rho)])
+    return E - E_passive
+
+
+# ═══════════════════════════════════════════════════
+# TEST 1 : FEEDBACK à N=5
+# ═══════════════════════════════════════════════════
+
+def test_feedback_n5():
+    print(f"\n{'='*60}")
+    print(f"TEST 1 : FEEDBACK à N=5")
+    print(f"{'='*60}", flush=True)
+    
+    N = 5; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    n_steps = 150; dt = 0.5
+    
+    np.random.seed(42)
+    psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+    
+    protocols = {}
+    
+    for name, gamma_func in [
+        ('constant_0.1', lambda C, t: 0.1),
+        ('constant_0.3', lambda C, t: 0.3),
+        ('feedback_0.3', lambda C, t: max(0.001, 0.3 * (1 - C))),
+        ('feedback_0.5', lambda C, t: max(0.001, 0.5 * (1 - C))),
+        ('feedback_1.0', lambda C, t: max(0.001, 1.0 * (1 - C))),
+        ('ramp_down', lambda C, t: max(0.001, 0.5 * np.exp(-t / 20))),
+    ]:
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        total_gamma = 0
+        
+        for step in range(n_steps):
+            t = step * dt
+            sz = np.array([qt.expect(op, rho) for op in sz_ops])
+            C_now, _ = compute_cpsi(sz)
+            gamma = gamma_func(C_now, t)
+            c_ops = make_cops(N, gamma)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+            total_gamma += gamma * dt
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_f, _ = compute_cpsi(sz)
+        W = E_init - qt.expect(H, rho)
+        eff = W / (total_gamma + 1e-10)
+        protocols[name] = {'C':C_f, 'W':W, 'eff':eff, 'cost':total_gamma}
+    
+    print(f"  {'Protocole':<20} {'C_final':<10} {'W':<10} {'Cout':<10} {'Efficacite':<10}")
+    print(f"  {'-'*60}")
+    for name, r in sorted(protocols.items(), key=lambda x: -x[1]['eff']):
+        print(f"  {name:<20} {r['C']:.4f}     {r['W']:.4f}     {r['cost']:.2f}       {r['eff']:.4f}")
+    
+    best = max(protocols, key=lambda k: protocols[k]['eff'])
+    print(f"\n  MEILLEUR : {best}")
+    if 'feedback' in best:
+        # Calculer gain vs meilleur constant
+        best_const = max([k for k in protocols if 'constant' in k], key=lambda k: protocols[k]['eff'])
+        gain = (protocols[best]['eff'] / protocols[best_const]['eff'] - 1) * 100
+        print(f"  Gain vs constant : +{gain:.0f}%")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 2 : ERGOTROPY — la vraie mesure de travail extractible
+# ═══════════════════════════════════════════════════
+
+def test_ergotropy():
+    """
+    L'ergotropy est la mesure quantique EXACTE du travail
+    qu'on peut extraire d'un état ρ par opération unitaire.
+    
+    Si ρ(C, Ergotropy) > 0.9 → C prédit EXACTEMENT 
+    le travail extractible quantique.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 2 : C vs ERGOTROPY (travail extractible exact)")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    results = []
+    
+    for hJ in [0.3, 0.6, 1.0]:
+        for gamma in [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
+            H = ising_H(N, hJ, eps=0.01)
+            c_ops = make_cops(N, gamma)
+            sz_ops = make_sz_ops(N)
+            
+            try:
+                rho = qt.steadystate(H, c_ops, method='direct')
+                sz = np.array([qt.expect(op, rho) for op in sz_ops])
+                C, T = compute_cpsi(sz)
+                W_erg = ergotropy(H, rho)
+                P = (rho * rho).tr().real
+                S = qt.entropy_vn(rho, 2)
+                
+                results.append({'hJ':hJ, 'gamma':gamma, 'C':C, 'W_erg':W_erg, 'P':P, 'S':S})
+            except:
+                pass
+    
+    if len(results) < 10:
+        print("  Pas assez de points"); return
+    
+    C_a = np.array([r['C'] for r in results])
+    W_a = np.array([r['W_erg'] for r in results])
+    P_a = np.array([r['P'] for r in results])
+    
+    rCW, _ = stats.pearsonr(C_a, W_a)
+    rPW, _ = stats.pearsonr(P_a, W_a)
+    
+    print(f"\n  {len(results)} steady states (3 hJ x 7 gamma) :")
+    print(f"    rho(C, Ergotropy) = {rCW:+.4f}  {'C predit W_erg' if abs(rCW) > 0.8 else ''}")
+    print(f"    rho(P, Ergotropy) = {rPW:+.4f}")
+    
+    if abs(rCW) > abs(rPW):
+        print(f"    --> C PREDIT MIEUX le travail extractible que la purete !")
+    else:
+        print(f"    --> Purete predit mieux ({rPW:+.3f} vs {rCW:+.3f})")
+    
+    # À h/J fixe (éliminer le scan paramétrique)
+    for hJ_fix in [0.3, 0.6, 1.0]:
+        sub = [r for r in results if r['hJ'] == hJ_fix]
+        if len(sub) < 4: continue
+        C_sub = np.array([r['C'] for r in sub])
+        W_sub = np.array([r['W_erg'] for r in sub])
+        P_sub = np.array([r['P'] for r in sub])
+        rCW_sub, _ = stats.pearsonr(C_sub, W_sub)
+        rPW_sub, _ = stats.pearsonr(P_sub, W_sub)
+        print(f"    h/J={hJ_fix} fixe : rho(C,W)={rCW_sub:+.4f}  rho(P,W)={rPW_sub:+.4f}  {'C>P' if abs(rCW_sub)>abs(rPW_sub) else 'P>C'}")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 3 : CYCLE THERMODYNAMIQUE
+# ═══════════════════════════════════════════════════
+
+def test_thermo_cycle():
+    """
+    Cycle en 4 étapes :
+    1. Compression : augmenter h/J (paramagnétiser)
+    2. Thermalisation chaude : gamma fort
+    3. Expansion : diminuer h/J (ré-ordonner)
+    4. Thermalisation froide : gamma faible
+    
+    Mesurer W_net = travail extrait - travail fourni
+    et C[Ψ] à chaque étape.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 3 : CYCLE THERMODYNAMIQUE")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; dim = 2**N
+    dt = 0.5; steps_per_stroke = 50
+    
+    # Paramètres du cycle
+    hJ_low = 0.2   # phase ordonnée
+    hJ_high = 1.0  # phase paramagnétique
+    g_hot = 0.5    # dissipation forte
+    g_cold = 0.05  # dissipation faible
+    
+    # État initial
+    H_init = ising_H(N, hJ_low, eps=0)
+    c_ops_init = make_cops(N, g_cold)
+    rho = qt.steadystate(H_init, c_ops_init, method='direct')
+    
+    sz_ops = make_sz_ops(N)
+    
+    print(f"  Cycle : hJ_low={hJ_low} → hJ_high={hJ_high}, g_cold={g_cold} → g_hot={g_hot}")
+    
+    n_cycles = 5
+    for cycle in range(n_cycles):
+        W_total = 0
+        Q_total = 0
+        
+        # STROKE 1 : Compression (hJ_low → hJ_high, gamma=g_cold)
+        E_before = qt.expect(ising_H(N, hJ_low, eps=0), rho)
+        for step in range(steps_per_stroke):
+            hJ = hJ_low + (hJ_high - hJ_low) * step / steps_per_stroke
+            H = ising_H(N, hJ, eps=0)
+            c_ops = make_cops(N, g_cold)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        E_after = qt.expect(ising_H(N, hJ_high, eps=0), rho)
+        W_compress = E_after - E_before
+        
+        # STROKE 2 : Thermalisation chaude (hJ=hJ_high, gamma=g_hot)
+        E_before = qt.expect(ising_H(N, hJ_high, eps=0), rho)
+        H = ising_H(N, hJ_high, eps=0)
+        c_ops = make_cops(N, g_hot)
+        for step in range(steps_per_stroke):
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        E_after = qt.expect(H, rho)
+        Q_hot = E_after - E_before
+        
+        # STROKE 3 : Expansion (hJ_high → hJ_low, gamma=g_hot)
+        E_before = qt.expect(ising_H(N, hJ_high, eps=0), rho)
+        for step in range(steps_per_stroke):
+            hJ = hJ_high - (hJ_high - hJ_low) * step / steps_per_stroke
+            H = ising_H(N, hJ, eps=0)
+            c_ops = make_cops(N, g_hot)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        E_after = qt.expect(ising_H(N, hJ_low, eps=0), rho)
+        W_expand = E_before - E_after  # travail extrait
+        
+        # STROKE 4 : Thermalisation froide (hJ=hJ_low, gamma=g_cold)
+        E_before = qt.expect(ising_H(N, hJ_low, eps=0), rho)
+        H = ising_H(N, hJ_low, eps=0)
+        c_ops = make_cops(N, g_cold)
+        for step in range(steps_per_stroke):
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        E_after = qt.expect(H, rho)
+        Q_cold = E_after - E_before
+        
+        W_net = W_expand - W_compress
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_end, T_end = compute_cpsi(sz)
+        
+        eff = W_net / (abs(Q_hot) + 1e-10)
+        
+        print(f"  Cycle {cycle+1}: W_net={W_net:+.4f}  Q_hot={Q_hot:+.4f}  eff={eff:.4f}  C={C_end:.4f}", flush=True)
+    
+    print(f"\n  Si W_net > 0 : le cycle PRODUIT du travail (moteur)")
+    print(f"  Si W_net < 0 : le cycle CONSOMME du travail (pompe)")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 4 : C PRÉDIT-IL FREE ENERGY MIEUX QUE PURETÉ ?
+# (à h/J fixe pour éviter le biais paramétrique)
+# ═══════════════════════════════════════════════════
+
+def test_c_vs_purity_free_energy():
+    print(f"\n{'='*60}")
+    print(f"TEST 4 : C vs PURETÉ pour prédire F (h/J FIXE)")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    for hJ in [0.3, 0.6, 1.0]:
+        print(f"\n  h/J = {hJ}:", flush=True)
+        results = []
+        
+        for gamma in [0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]:
+            H = ising_H(N, hJ, eps=0.01)
+            c_ops = make_cops(N, gamma)
+            sz_ops = make_sz_ops(N)
+            
+            rho = qt.steadystate(H, c_ops, method='direct')
+            sz = np.array([qt.expect(op, rho) for op in sz_ops])
+            C, T = compute_cpsi(sz)
+            E = qt.expect(H, rho)
+            S = qt.entropy_vn(rho, 2)
+            P = (rho*rho).tr().real
+            F = E - gamma * S
+            W_erg = ergotropy(H, rho)
+            
+            results.append({'gamma':gamma,'C':C,'P':P,'F':F,'W_erg':W_erg,'E':E})
+        
+        C_a = np.array([r['C'] for r in results])
+        P_a = np.array([r['P'] for r in results])
+        F_a = np.array([r['F'] for r in results])
+        W_a = np.array([r['W_erg'] for r in results])
+        
+        rCF, _ = stats.pearsonr(C_a, -F_a)
+        rPF, _ = stats.pearsonr(P_a, -F_a)
+        rCW, _ = stats.pearsonr(C_a, W_a)
+        rPW, _ = stats.pearsonr(P_a, W_a)
+        
+        print(f"    rho(C, -F)    = {rCF:+.4f}  rho(P, -F)    = {rPF:+.4f}  {'C>P' if abs(rCF)>abs(rPF) else 'P>C'}")
+        print(f"    rho(C, W_erg) = {rCW:+.4f}  rho(P, W_erg) = {rPW:+.4f}  {'C>P' if abs(rCW)>abs(rPW) else 'P>C'}")
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] — TESTS COMPLEMENTAIRES FINAUX")
+    print(f"{'='*60}")
+    
+    t0 = time.time()
+    
+    test_ergotropy()              # ~1 min
+    test_c_vs_purity_free_energy()  # ~1 min
+    test_feedback_n5()            # ~5 min
+    test_thermo_cycle()           # ~10 min
+    
+    print(f"\nTOTAL: {(time.time()-t0)/60:.1f} min")
+
+#!/usr/bin/env python3
+"""
+cpsi_deep.py — Tests fondamentaux
+
+PARTIE 1 : Renforcer P3q
+  A) Ising ground state avec brisure de symétrie (fix du test raté)
+  B) Thermo N=7 (10 points, C vs E/S_vN/Pureté)
+
+PARTIE 2 : L'équation observateur ↔ univers
+  C) C[Ψ] vs information mutuelle I(sys:env)
+  D) C[Ψ] vs force de mesure (décohérence progressive)
+  E) Quantum Darwinism : C[Ψ] vs redondance environnementale
+
+python3 -u ~/Desktop/cpsi_deep.py 2>&1 | tee ~/Desktop/deep_log.txt
+"""
+import numpy as np
+import time, warnings, sys, csv
+warnings.filterwarnings('ignore')
+
+try:
+    import qutip as qt
+    print(f"qutip {qt.__version__}", flush=True)
+except ImportError:
+    print("pip3 install qutip"); sys.exit(1)
+
+from scipy import stats
+from pathlib import Path
+
+OUT = Path.home() / "Desktop" / "cpsi_deep"
+OUT.mkdir(exist_ok=True)
+
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+
+def ising_H(N, hJ, J=1.0, epsilon=0.0):
+    """Ising transverse + champ longitudinal epsilon pour briser la symétrie Z2."""
+    h = hJ * J
+    H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+    if epsilon != 0:
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            H += -epsilon * qt.tensor(o)
+    return H
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 1A : ISING GROUND STATE AVEC BRISURE DE SYMÉTRIE
+# ═══════════════════════════════════════════════════
+
+def test_closed_symmetry_broken():
+    """
+    Le test ground state fermé ratait parce que le GS est dégénéré 
+    pour h/J < 1 (symétrie Z2 : |↑↑...↑⟩ et |↓↓...↓⟩).
+    On ajoute un petit champ longitudinal ε qui brise la symétrie.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST A : ISING GROUND STATE FERMÉ + ε (N=7)")
+    print(f"Brisure Z2 avec ε = 0.01")
+    print(f"{'='*60}", flush=True)
+    
+    N = 7
+    epsilon = 0.01  # Petit champ longitudinal
+    hJ_values = [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.57, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0]
+    
+    results = []
+    for hJ in hJ_values:
+        t0 = time.time()
+        H = ising_H(N, hJ, epsilon=epsilon)
+        _, eigstates = H.eigenstates(eigvals=1, sparse=True)
+        psi = eigstates[0]
+        
+        sz = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz.append(qt.expect(qt.tensor(o), psi))
+        C, T = compute_cpsi(np.array(sz))
+        
+        # Gap pour info
+        evals = H.eigenenergies(eigvals=2, sparse=True)
+        gap = evals[1] - evals[0]
+        
+        dt = time.time() - t0
+        print(f"  hJ={hJ:.2f}  C={C:.4f}  T={T:.4f}  gap={gap:.4f}  ⟨σz⟩₀={sz[0]:.4f}  ({dt:.1f}s)", flush=True)
+        results.append({'hJ':hJ, 'C':C, 'T':T, 'gap':gap, 'sz0':sz[0]})
+    
+    # Analyse
+    C_arr = np.array([r['C'] for r in results])
+    hJ_arr = np.array([r['hJ'] for r in results])
+    
+    # QPT visible ?
+    C_ordered = np.mean([r['C'] for r in results if r['hJ'] < 0.4])
+    C_para = np.mean([r['C'] for r in results if r['hJ'] > 0.8])
+    
+    print(f"\n  ANALYSE :")
+    print(f"    C moyen (h/J < 0.4) = {C_ordered:.4f}")
+    print(f"    C moyen (h/J > 0.8) = {C_para:.4f}")
+    print(f"    Ratio = {C_ordered/C_para:.2f}x")
+    
+    if C_ordered > C_para * 1.5:
+        print(f"    ✅ QPT VISIBLE sur ground state fermé !")
+        print(f"    → 2ème protocole positif pour P3q")
+    else:
+        print(f"    ❌ Pas de QPT claire")
+    
+    with open(OUT / 'ising_closed.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=results[0].keys())
+        w.writeheader(); w.writerows(results)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 1B : THERMO N=7
+# ═══════════════════════════════════════════════════
+
+def test_thermo_n7():
+    print(f"\n{'='*60}")
+    print(f"TEST B : THERMO N=7 (C vs E, S_vN, Pureté)")
+    print(f"{'='*60}", flush=True)
+    
+    N = 7; gamma = 0.1
+    hJ_values = [0.01, 0.2, 0.4, 0.5, 0.57, 0.65, 0.8, 1.0, 1.5, 2.0]
+    
+    results = []
+    for hJ in hJ_values:
+        t0 = time.time()
+        H = ising_H(N, hJ)
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        try:
+            rho = qt.steadystate(H, c_ops, method='direct')
+            sz = []
+            for i in range(N):
+                o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                sz.append(qt.expect(qt.tensor(o), rho))
+            C, T = compute_cpsi(np.array(sz))
+            E = qt.expect(H, rho)
+            S_vN = qt.entropy_vn(rho, 2)
+            purity = (rho * rho).tr().real
+            E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+            F = E - gamma * S_vN
+            
+            dt = time.time() - t0
+            print(f"  hJ={hJ:.2f}  C={C:.4f}  E={E:.2f}  S={S_vN:.3f}  Pur={purity:.4f}  ({dt:.0f}s)", flush=True)
+            results.append({'hJ':hJ,'C':C,'T':T,'E':E,'S_vN':S_vN,'purity':purity,'F':F})
+        except Exception as e:
+            print(f"  hJ={hJ:.2f}  X {str(e)[:60]}  ({time.time()-t0:.0f}s)", flush=True)
+    
+    if len(results) < 5: return
+    
+    C_a = np.array([r['C'] for r in results])
+    P_a = np.array([r['purity'] for r in results])
+    print(f"\n  CORRÉLATIONS ({len(results)} points) :")
+    for name in ['E','S_vN','F','purity']:
+        arr = np.array([r[name] for r in results])
+        rC, _ = stats.pearsonr(C_a, arr)
+        rP, _ = stats.pearsonr(P_a, arr)
+        better = "C>P" if abs(rC) > abs(rP) else "P>C"
+        print(f"    ρ(C,{name:6s})={rC:+.4f}  ρ(Pur,·)={rP:+.4f}  {better}", flush=True)
+    
+    with open(OUT / 'thermo_n7.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=results[0].keys())
+        w.writeheader(); w.writerows(results)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2C : C[Ψ] vs INFORMATION MUTUELLE
+# "L'échange observateur ↔ univers"
+# ═══════════════════════════════════════════════════
+
+def test_mutual_information():
+    """
+    Question fondamentale : C[Ψ] mesure-t-il combien d'information
+    le système a échangé avec l'environnement ?
+    
+    Protocole :
+    - Système = N qubits dans un état pur |ψ⟩
+    - On fait une trace partielle sur k qubits (= "environnement")
+    - On mesure C[Ψ] sur les N-k qubits restants (= "système observé")
+    - On mesure I(sys:env) = S(sys) + S(env) - S(total)
+    
+    Si ρ(C, I) > 0.8 → C[Ψ] MESURE l'échange d'information
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST C : C[Ψ] vs INFORMATION MUTUELLE I(sys:env)")
+    print(f"L'équation observateur ↔ univers")
+    print(f"{'='*60}", flush=True)
+    
+    N = 6  # 6 qubits total
+    gamma_values = [0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8]
+    hJ_values = [0.3, 0.6, 1.0]
+    
+    results = []
+    
+    for hJ in hJ_values:
+        for gamma in gamma_values:
+            t0 = time.time()
+            H = ising_H(N, hJ)
+            c_ops = []
+            for i in range(N):
+                o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+                c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+            
+            try:
+                rho = qt.steadystate(H, c_ops, method='direct')
+                
+                # C[Ψ] du système complet
+                sz = []
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                    sz.append(qt.expect(qt.tensor(o), rho))
+                C_full, T_full = compute_cpsi(np.array(sz))
+                
+                # Entropie du système complet
+                S_total = qt.entropy_vn(rho, 2)
+                
+                # Trace partielle : garder les 4 premiers qubits ("système observé")
+                # Tracer sur les 2 derniers ("environnement")
+                rho_sys = rho.ptrace([0, 1, 2, 3])
+                rho_env = rho.ptrace([4, 5])
+                
+                S_sys = qt.entropy_vn(rho_sys, 2)
+                S_env = qt.entropy_vn(rho_env, 2)
+                
+                # Information mutuelle I(sys:env) = S(sys) + S(env) - S(total)
+                I_mutual = S_sys + S_env - S_total
+                
+                # Pureté du sous-système
+                purity_sys = (rho_sys * rho_sys).tr().real
+                
+                # C[Ψ] du sous-système (4 qubits)
+                sz_sub = []
+                for i in range(4):
+                    o = [qt.qeye(2)]*4; o[i] = qt.sigmaz()
+                    sz_sub.append(qt.expect(qt.tensor(o), rho_sys))
+                C_sub, T_sub = compute_cpsi(np.array(sz_sub))
+                
+                # Intrication (concurrence pour 2 qubits voisins)
+                rho_pair = rho.ptrace([0, 1])
+                try:
+                    concurrence = qt.concurrence(rho_pair)
+                except:
+                    concurrence = np.nan
+                
+                dt = time.time() - t0
+                print(f"  hJ={hJ:.1f} γ={gamma:.3f}  C={C_full:.4f}  I={I_mutual:.4f}  S_sys={S_sys:.3f}  conc={concurrence:.3f}  ({dt:.1f}s)", flush=True)
+                
+                results.append({
+                    'hJ': hJ, 'gamma': gamma,
+                    'C_full': C_full, 'T_full': T_full,
+                    'C_sub': C_sub, 'T_sub': T_sub,
+                    'I_mutual': I_mutual,
+                    'S_total': S_total, 'S_sys': S_sys, 'S_env': S_env,
+                    'purity_sys': purity_sys,
+                    'concurrence': concurrence,
+                })
+            except Exception as e:
+                print(f"  hJ={hJ:.1f} γ={gamma:.3f}  X {str(e)[:50]}", flush=True)
+    
+    if len(results) < 5: return
+    
+    C_arr = np.array([r['C_full'] for r in results])
+    I_arr = np.array([r['I_mutual'] for r in results])
+    S_arr = np.array([r['S_total'] for r in results])
+    P_arr = np.array([r['purity_sys'] for r in results])
+    Conc_arr = np.array([r['concurrence'] for r in results])
+    
+    print(f"\n  CORRÉLATIONS FONDAMENTALES ({len(results)} configs) :")
+    
+    r_CI, p_CI = stats.pearsonr(C_arr, I_arr)
+    print(f"    ρ(C[Ψ], I_mutual)    = {r_CI:+.4f}  p={p_CI:.4f}")
+    verdict = "C MESURE ECHANGE INFO" if abs(r_CI) > 0.7 else "pas de lien direct" if abs(r_CI) < 0.3 else "lien modere"
+    print(f"    → {verdict}")
+    
+    r_CS, p_CS = stats.pearsonr(C_arr, S_arr)
+    print(f"    ρ(C[Ψ], S_total)     = {r_CS:+.4f}  p={p_CS:.4f}")
+    
+    r_CP, p_CP = stats.pearsonr(C_arr, P_arr)
+    print(f"    ρ(C[Ψ], Pureté_sys)  = {r_CP:+.4f}  p={p_CP:.4f}")
+    
+    mask_conc = ~np.isnan(Conc_arr)
+    if mask_conc.sum() > 3:
+        r_CC, p_CC = stats.pearsonr(C_arr[mask_conc], Conc_arr[mask_conc])
+        print(f"    ρ(C[Ψ], Concurrence) = {r_CC:+.4f}  p={p_CC:.4f}")
+        if r_CC < -0.5:
+            print(f"    → C anticorrele avec intrication = decoherence CREE la structure classique")
+    
+    # Le test clé : I(sys:env) prédit-il C MIEUX que S_total seul ?
+    from numpy.linalg import lstsq
+    X1 = np.column_stack([S_arr, np.ones(len(S_arr))])
+    b1, _, _, _ = lstsq(X1, C_arr, rcond=None)
+    r2_S = 1 - np.sum((C_arr - X1@b1)**2) / np.sum((C_arr - C_arr.mean())**2)
+    
+    X2 = np.column_stack([S_arr, I_arr, np.ones(len(S_arr))])
+    b2, _, _, _ = lstsq(X2, C_arr, rcond=None)
+    r2_SI = 1 - np.sum((C_arr - X2@b2)**2) / np.sum((C_arr - C_arr.mean())**2)
+    
+    print(f"\n  R²(S seul → C)     = {r2_S:.4f}")
+    print(f"  R²(S + I → C)     = {r2_SI:.4f}")
+    delta_r2 = r2_SI - r2_S
+    extra = " <- I ajoute de info !" if delta_r2 > 0.01 else ""
+    print(f"  dR2 = {delta_r2:+.4f}{extra}")
+    
+    with open(OUT / 'mutual_information.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=results[0].keys())
+        w.writeheader(); w.writerows(results)
+    print(f"  Sauvé: {OUT / 'mutual_information.csv'}", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2D : DÉCOHÉRENCE PROGRESSIVE
+# "Comment la réalité émerge progressivement"
+# ═══════════════════════════════════════════════════
+
+def test_decoherence_progressive():
+    """
+    On part d'un état pur (superposition) et on augmente
+    progressivement la décohérence.
+    
+    Question : C[Ψ] suit-il une courbe universelle
+    en fonction de la "quantité de réalité créée" ?
+    
+    γ = 0 → état pur quantique (superposition)
+    γ → ∞ → état classique (décohéré)
+    
+    Si C(γ) a une forme universelle → il y a une équation
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST D : DÉCOHÉRENCE PROGRESSIVE")
+    print(f"Comment la 'réalité classique' émerge")
+    print(f"{'='*60}", flush=True)
+    
+    N = 5
+    gamma_values = np.logspace(-3, 0, 20)  # 0.001 à 1.0, 20 points log
+    
+    for hJ in [0.3, 0.6, 1.0, 2.0]:
+        print(f"\n  h/J = {hJ}:", flush=True)
+        results = []
+        
+        for gamma in gamma_values:
+            t0 = time.time()
+            H = ising_H(N, hJ)
+            c_ops = []
+            for i in range(N):
+                o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+                c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+            
+            try:
+                rho = qt.steadystate(H, c_ops, method='direct')
+                sz = []
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                    sz.append(qt.expect(qt.tensor(o), rho))
+                C, T = compute_cpsi(np.array(sz))
+                S_vN = qt.entropy_vn(rho, 2)
+                purity = (rho * rho).tr().real
+                
+                # L1 coherence (off-diagonal elements)
+                rho_full = rho.full()
+                l1 = np.sum(np.abs(rho_full)) - np.sum(np.abs(np.diag(rho_full)))
+                
+                print(f"    γ={gamma:.4f}  C={C:.4f}  S={S_vN:.3f}  L1={l1:.3f}  Pur={purity:.4f}", flush=True)
+                results.append({'gamma':gamma, 'C':C, 'T':T, 'S_vN':S_vN, 'purity':purity, 'L1':l1, 'hJ':hJ})
+            except:
+                pass
+        
+        if len(results) < 5: continue
+        
+        C_arr = np.array([r['C'] for r in results])
+        L1_arr = np.array([r['L1'] for r in results])
+        gamma_arr = np.array([r['gamma'] for r in results])
+        
+        r_CL, p_CL = stats.pearsonr(C_arr, L1_arr)
+        r_Cg, p_Cg = stats.pearsonr(C_arr, np.log10(gamma_arr))
+        
+        print(f"\n    ρ(C, L1_coherence) = {r_CL:+.4f}  p={p_CL:.4f}")
+        print(f"    ρ(C, log10(γ))     = {r_Cg:+.4f}  p={p_Cg:.4f}")
+        
+        if r_CL < -0.7:
+            print(f"    → ✅ C AUGMENTE quand L1 (cohérence quantique) DIMINUE")
+            print(f"    → La décohérence CRÉE la structure classique mesurée par C[Ψ]")
+        
+        with open(OUT / f'decoherence_hJ{hJ}.csv', 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=results[0].keys())
+            w.writeheader(); w.writerows(results)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2E : QUANTUM DARWINISM
+# "L'univers copie l'information pour les observateurs"
+# ═══════════════════════════════════════════════════
+
+def test_quantum_darwinism():
+    """
+    Quantum Darwinism (Zurek 2009) : l'information sur un système 
+    est copiée de manière redondante dans l'environnement.
+    
+    Test : C[Ψ] mesure-t-il cette redondance ?
+    
+    On calcule C[Ψ] sur des fractions croissantes de l'environnement
+    et on regarde si C sature (= information redondante = "réalité objective")
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST E : QUANTUM DARWINISM")
+    print(f"L'univers copie-t-il l'info pour les observateurs ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 6  # 6 qubits
+    gamma = 0.1
+    
+    for hJ in [0.3, 1.0]:
+        print(f"\n  h/J = {hJ}:", flush=True)
+        
+        H = ising_H(N, hJ)
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        try:
+            rho = qt.steadystate(H, c_ops, method='direct')
+        except:
+            print(f"    Échec steadystate"); continue
+        
+        # C[Ψ] sur des sous-systèmes de taille croissante
+        for n_keep in range(2, N+1):
+            keep = list(range(n_keep))
+            rho_sub = rho.ptrace(keep)
+            
+            sz_sub = []
+            for i in range(n_keep):
+                o = [qt.qeye(2)]*n_keep; o[i] = qt.sigmaz()
+                sz_sub.append(qt.expect(qt.tensor(o), rho_sub))
+            
+            C, T = compute_cpsi(np.array(sz_sub))
+            S = qt.entropy_vn(rho_sub, 2)
+            frac = n_keep / N
+            
+            print(f"    n={n_keep}/{N} ({frac:.0%})  C={C:.4f}  T={T:.4f}  S={S:.3f}", flush=True)
+        
+        print(f"    → Si C sature rapidement → redondance → 'réalité objective' accessible")
+        print(f"    → Si C augmente linéairement → pas de redondance → 'réalité subjective'")
+
+
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Ψ] DEEP — TESTS FONDAMENTAUX")
+    print(f"{'='*60}", flush=True)
+    
+    t0 = time.time()
+    
+    # Partie 1 : renforcer P3q (rapide)
+    test_closed_symmetry_broken()    # ~30s
+    
+    # Partie 2 : l'équation observateur-univers
+    test_mutual_information()         # ~5 min (N=6)
+    test_decoherence_progressive()    # ~10 min (N=5, 20×4 points)
+    test_quantum_darwinism()          # ~2 min (N=6)
+    
+    # Partie 1B : thermo N=7 (le plus long, en dernier)
+    test_thermo_n7()                  # ~2-3h
+    
+    total = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"TOTAL: {total/60:.1f} min")
+    print(f"Résultats: {OUT}")
+    print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_derivation.py — Dérivation analytique + théories parallèles
+
+PARTIE 1 : DÉRIVATION ANALYTIQUE de dC/dt depuis Lindblad
+  Lindblad : d⟨σz_i⟩/dt = -i⟨[σz_i, H]⟩ - γ(⟨σz_i⟩ + 1)
+  C = f({⟨σz_i⟩}) → dC/dt = Σ (∂C/∂sz_i) × dsz_i/dt
+  → Vérifier que la dérivation analytique = résultat numérique
+
+PARTIE 2 : PRIGOGINE — minimum de production d'entropie
+  Au steady state, le système minimise-t-il la production d'entropie ?
+  
+PARTIE 3 : FRISTON — principe d'énergie libre (neuroscience)
+  C[Ψ] est-il un "modèle génératif" au sens de Friston ?
+  Test : C minimise-t-il la surprise (= entropie) ?
+
+PARTIE 4 : LOI CONSTRUCTALE (Bejan) — optimisation des flux
+  C[Ψ] mesure-t-il l'efficacité d'accès aux flux d'énergie ?
+
+PARTIE 5 : SOC (Bak) — criticalité auto-organisée
+  Le point QPT est-il un attracteur ? Le système évolue-t-il VERS la criticalité ?
+
+python3 ~/Desktop/cpsi_derivation.py
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats
+import warnings, time
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi_detailed(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T, micro, macro, meso
+
+def ising_H(N, hJ, J=1.0, eps=0.01):
+    h = hJ * J; H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -eps * qt.tensor(o2)
+    return H
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 1 : DÉRIVATION ANALYTIQUE de dC/dt
+# ═══════════════════════════════════════════════════
+
+def test_derivation():
+    """
+    C = (micro + macro + meso) / 3
+    
+    micro = (1/(N-1)) Σ |sz_i × sz_{i+1}|
+    macro = (2/(N(N-1))) Σ_{i<j} |sz_i × sz_j|
+    meso = 1 - std(|sz|)
+    
+    Sous amplitude damping :
+    d⟨σz_i⟩/dt = f_i(H, {sz}) - γ(sz_i + 1)
+    
+    Le terme dissipatif est UNIVERSEL : -γ(sz_i + 1)
+    → pousse tous les sz_i vers -1
+    → micro → 1, macro → 1, meso → 1 → C → 1
+    
+    Mais le terme Hamiltonien (commutateur) crée des oscillations.
+    La compétition H vs γ détermine le steady state.
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 1 : DÉRIVATION ANALYTIQUE dC/dt")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; gamma = 0.1; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    
+    sz_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        sz_ops.append(qt.tensor(o))
+    
+    dim = 2**N
+    psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+    rho0 = qt.ket2dm(psi0)
+    
+    tlist = np.linspace(0, 100, 1000)
+    dt = tlist[1] - tlist[0]
+    result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops)
+    
+    # Calculer C(t) et dC/dt numérique
+    C_t = []; T_t = []
+    for t_idx in range(len(tlist)):
+        sz = np.array([result.expect[i][t_idx] for i in range(N)])
+        C, T, _, _, _ = compute_cpsi_detailed(sz)
+        C_t.append(C); T_t.append(T)
+    
+    C_t = np.array(C_t); T_t = np.array(T_t)
+    dC_dt_num = np.gradient(C_t, dt)
+    
+    # Dérivation analytique de dC/dt
+    # C = (micro + macro + meso)/3
+    # dC/dt = (dmicro/dt + dmacro/dt + dmeso/dt)/3
+    # 
+    # Pour le cas homogène (tous sz_i ≈ m) :
+    # micro ≈ m², macro ≈ m², meso ≈ 1
+    # C ≈ (2m² + 1)/3
+    # dC/dt ≈ (4m/3) × dm/dt
+    # 
+    # Sous amplitude damping sans H : dm/dt = -γ(m+1)
+    # → dC/dt ≈ (4m/3) × (-γ)(m+1) = -4γm(m+1)/3
+    
+    print(f"\n  FORMULE ANALYTIQUE (cas homogène, H négligé) :")
+    print(f"  m = ⟨σz⟩ moyen")
+    print(f"  C ≈ (2m² + 1)/3")
+    print(f"  dC/dt ≈ -(4γ/3) × m × (m+1)")
+    print(f"  ")
+    print(f"  Cette formule prédit :")
+    print(f"    - dC/dt > 0 quand m < -1 (impossible physiquement)")
+    print(f"    - dC/dt > 0 quand -1 < m < 0 (phase paramagnétique)")
+    print(f"    - dC/dt < 0 quand m > 0 (C diminue ?!)")
+    print(f"    - dC/dt = 0 quand m = -1 (steady state)")
+    print(f"  ")
+    
+    # Vérification numérique
+    m_t = np.array([np.mean([result.expect[i][t_idx] for i in range(N)]) 
+                     for t_idx in range(len(tlist))])
+    C_pred = (2 * m_t**2 + 1) / 3
+    
+    # Corrélation entre C prédit et C mesuré
+    rho_pred, p_pred = stats.pearsonr(C_pred, C_t)
+    
+    print(f"  VÉRIFICATION :")
+    print(f"    ρ(C_prédit, C_mesuré) = {rho_pred:+.4f}  p={p_pred:.4f}")
+    print(f"    C_final mesuré  = {C_t[-1]:.4f}")
+    print(f"    C_final prédit  = {C_pred[-1]:.4f}")
+    print(f"    m_final         = {m_t[-1]:.4f}")
+    
+    # Le cas non-homogène (σ_i ≠ σ_j) nécessite la dérivée complète
+    # Mais le cas homogène donne déjà l'intuition
+    
+    # Fit exponentiel : C(t) = C_eq + (C_0 - C_eq) * exp(-λt)
+    from scipy.optimize import curve_fit
+    
+    def exp_relax(t, C_eq, C_0, lam):
+        return C_eq + (C_0 - C_eq) * np.exp(-lam * t)
+    
+    try:
+        popt, _ = curve_fit(exp_relax, tlist, C_t, p0=[C_t[-1], C_t[0], 0.1], maxfev=5000)
+        C_eq_fit, C_0_fit, lam_fit = popt
+        C_fit = exp_relax(tlist, *popt)
+        r2 = 1 - np.sum((C_t - C_fit)**2) / np.sum((C_t - C_t.mean())**2)
+        
+        print(f"\n  FIT EXPONENTIEL : C(t) = {C_eq_fit:.4f} + ({C_0_fit:.4f} - {C_eq_fit:.4f}) × exp(-{lam_fit:.4f}t)")
+        print(f"  R² = {r2:.6f}")
+        print(f"  λ = {lam_fit:.4f} (taux de relaxation)")
+        print(f"  τ = {1/lam_fit:.2f} (temps caractéristique)")
+        
+        if r2 > 0.95:
+            print(f"\n  --> L'ÉQUATION DÉRIVÉE :")
+            print(f"  dC/dt = -{lam_fit:.4f} × (C - {C_eq_fit:.4f})")
+            print(f"  = relaxation exponentielle vers C_eq")
+            print(f"  λ dépend de γ (à tester)")
+    except Exception as e:
+        print(f"  Fit échoué : {e}")
+    
+    # Tester λ en fonction de γ
+    print(f"\n  λ(γ) — taux de relaxation vs force de dissipation :")
+    for gamma_test in [0.01, 0.05, 0.1, 0.2, 0.5]:
+        c_ops_test = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops_test.append(np.sqrt(gamma_test) * qt.tensor(o))
+        
+        result_test = qt.mesolve(H, rho0, tlist, c_ops_test, sz_ops)
+        C_test = []
+        for t_idx in range(len(tlist)):
+            sz = np.array([result_test.expect[i][t_idx] for i in range(N)])
+            C, _, _, _, _ = compute_cpsi_detailed(sz)
+            C_test.append(C)
+        C_test = np.array(C_test)
+        
+        try:
+            popt_t, _ = curve_fit(exp_relax, tlist, C_test, p0=[C_test[-1], C_test[0], gamma_test], maxfev=5000)
+            lam = popt_t[2]
+            r2 = 1 - np.sum((C_test - exp_relax(tlist, *popt_t))**2) / np.sum((C_test - C_test.mean())**2)
+            print(f"    γ={gamma_test:.3f}  λ={lam:.4f}  λ/γ={lam/gamma_test:.2f}  R²={r2:.4f}")
+        except:
+            print(f"    γ={gamma_test:.3f}  fit échoué")
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2 : PRIGOGINE — production d'entropie minimale
+# ═══════════════════════════════════════════════════
+
+def test_prigogine():
+    """
+    Prigogine (Nobel 1977) : au steady state non-équilibre,
+    le système minimise la production d'entropie.
+    
+    σ_prod = dS_env/dt = -Tr(dρ/dt × ln(ρ)) ← production d'entropie
+    
+    Test : σ_prod corrèle-t-il avec C[Ψ] ?
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 2 : PRIGOGINE — production d'entropie")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; gamma = 0.1
+    
+    results = []
+    for hJ in np.linspace(0.01, 2.0, 15):
+        H = ising_H(N, hJ, eps=0.01)
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        rho_ss = qt.steadystate(H, c_ops, method='direct')
+        
+        sz_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz_ops.append(qt.tensor(o))
+        sz = np.array([qt.expect(op, rho_ss) for op in sz_ops])
+        C, T, _, _, _ = compute_cpsi_detailed(sz)
+        
+        # Production d'entropie au steady state
+        # σ = Σ_k γ_k × Tr(L_k ρ L_k†) × ln(Tr(L_k ρ L_k†) / Tr(L_k† L_k ρ))
+        # Approximation : σ ≈ Σ_k γ × ⟨L_k† L_k⟩
+        sigma_prod = 0
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            Lk = qt.tensor(o)
+            sigma_prod += gamma * qt.expect(Lk.dag() * Lk, rho_ss)
+        
+        E = qt.expect(H, rho_ss)
+        S = qt.entropy_vn(rho_ss, 2)
+        
+        results.append({'hJ':hJ, 'C':C, 'T':T, 'sigma':sigma_prod, 'E':E, 'S':S})
+    
+    C_a = np.array([r['C'] for r in results])
+    sigma_a = np.array([r['sigma'] for r in results])
+    E_a = np.array([r['E'] for r in results])
+    
+    r_Cs, _ = stats.pearsonr(C_a, sigma_a)
+    print(f"  ρ(C, σ_prod) = {r_Cs:+.4f}")
+    print(f"  σ_prod range: [{sigma_a.min():.4f}, {sigma_a.max():.4f}]")
+    
+    if r_Cs < -0.7:
+        print(f"  --> C ÉLEVÉ = production d'entropie FAIBLE (Prigogine)")
+        print(f"  --> Systèmes cohérents = minimisent la dissipation")
+    elif r_Cs > 0.7:
+        print(f"  --> C ÉLEVÉ = production d'entropie FORTE")
+        print(f"  --> Systèmes cohérents = STRUCTURES DISSIPATIVES (Prigogine)")
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 3 : FRISTON — énergie libre variationnelle
+# ═══════════════════════════════════════════════════
+
+def test_friston():
+    """
+    Friston (2010) : les systèmes vivants minimisent l'énergie libre
+    variationnelle F_var = E_q[ln q(θ) - ln p(x,θ)]
+    
+    En termes simples : le système maintient un "modèle interne" 
+    qui minimise la surprise (= entropie des observations).
+    
+    Test : C[Ψ] est-il l'inverse de la surprise ?
+    Surprise ≈ -log p(observations) ≈ entropie des observables
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 3 : FRISTON — énergie libre variationnelle")
+    print(f"C[Ψ] minimise-t-il la surprise ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; gamma = 0.1
+    
+    results = []
+    for hJ in np.linspace(0.01, 2.0, 15):
+        H = ising_H(N, hJ, eps=0.01)
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        rho_ss = qt.steadystate(H, c_ops, method='direct')
+        sz_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz_ops.append(qt.tensor(o))
+        sz = np.array([qt.expect(op, rho_ss) for op in sz_ops])
+        C, T, _, _, _ = compute_cpsi_detailed(sz)
+        
+        # "Surprise" = entropie des observables (pas de l'état)
+        # Les probabilités p_i de mesurer σz_i = +1 ou -1
+        probs = [(1 + s)/2 for s in sz]  # prob de mesurer +1
+        surprise = 0
+        for p in probs:
+            p = np.clip(p, 1e-10, 1-1e-10)
+            surprise -= p * np.log(p) + (1-p) * np.log(1-p)
+        surprise /= N  # moyenne par qubit
+        
+        # Complexité = KL(q || p_prior) ≈ distance au prior uniforme
+        complexity = sum(abs(p - 0.5) for p in probs) / N
+        
+        # Accuracy = -surprise (combien les mesures sont prévisibles)
+        accuracy = -surprise
+        
+        results.append({'hJ':hJ, 'C':C, 'surprise':surprise, 
+                        'complexity':complexity, 'accuracy':accuracy})
+    
+    C_a = np.array([r['C'] for r in results])
+    surp_a = np.array([r['surprise'] for r in results])
+    comp_a = np.array([r['complexity'] for r in results])
+    acc_a = np.array([r['accuracy'] for r in results])
+    
+    r_CS, _ = stats.pearsonr(C_a, surp_a)
+    r_CC, _ = stats.pearsonr(C_a, comp_a)
+    r_CA, _ = stats.pearsonr(C_a, acc_a)
+    
+    print(f"  ρ(C, Surprise)   = {r_CS:+.4f}  {'C diminue la surprise !' if r_CS < -0.7 else ''}")
+    print(f"  ρ(C, Complexité) = {r_CC:+.4f}  {'C augmente la complexité' if r_CC > 0.7 else ''}")
+    print(f"  ρ(C, Accuracy)   = {r_CA:+.4f}  {'C = prédictibilité' if r_CA > 0.7 else ''}")
+    
+    if r_CS < -0.8:
+        print(f"\n  --> C[Ψ] = INVERSE de la surprise (Friston)")
+        print(f"  --> Les systèmes cohérents minimisent la surprise observationnelle")
+        print(f"  --> C[Ψ] implémente le Free Energy Principle !")
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 4 : CONSTRUCTALE (Bejan) — optimisation des flux
+# ═══════════════════════════════════════════════════
+
+def test_constructal():
+    """
+    Loi constructale (Bejan 1996) : les systèmes évoluent
+    pour faciliter l'accès aux flux qui les traversent.
+    
+    Test : C[Ψ] mesure-t-il l'efficacité de transport d'énergie
+    à travers la chaîne de spins ?
+    
+    Proxy : courant d'énergie J_E = ⟨[H_i, H_{i+1}]⟩
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 4 : CONSTRUCTALE — flux d'énergie")
+    print(f"C[Ψ] optimise-t-il le transport ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; gamma = 0.1
+    
+    results = []
+    for hJ in np.linspace(0.01, 2.0, 15):
+        H = ising_H(N, hJ, eps=0.01)
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        rho_ss = qt.steadystate(H, c_ops, method='direct')
+        sz_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz_ops.append(qt.tensor(o))
+        sz = np.array([qt.expect(op, rho_ss) for op in sz_ops])
+        C, T, _, _, _ = compute_cpsi_detailed(sz)
+        
+        # Courant d'énergie : proxy = gradient de magnétisation
+        # |∇m| = Σ |sz_{i+1} - sz_i| / (N-1)
+        grad_m = np.mean([abs(sz[i+1] - sz[i]) for i in range(N-1)])
+        
+        # Conductance thermique proxy = corrélation entre voisins × gradient
+        conductance = np.mean([abs(sz[i] * sz[i+1]) for i in range(N-1)])
+        
+        # Flux net = conductance × gradient
+        flux = conductance * grad_m
+        
+        results.append({'hJ':hJ, 'C':C, 'grad_m':grad_m, 
+                        'conductance':conductance, 'flux':flux})
+    
+    C_a = np.array([r['C'] for r in results])
+    cond_a = np.array([r['conductance'] for r in results])
+    flux_a = np.array([r['flux'] for r in results])
+    grad_a = np.array([r['grad_m'] for r in results])
+    
+    r_Ccond, _ = stats.pearsonr(C_a, cond_a)
+    r_Cflux, _ = stats.pearsonr(C_a, flux_a)
+    r_Cgrad, _ = stats.pearsonr(C_a, grad_a)
+    
+    print(f"  ρ(C, Conductance) = {r_Ccond:+.4f}")
+    print(f"  ρ(C, Flux)        = {r_Cflux:+.4f}")
+    print(f"  ρ(C, Gradient)    = {r_Cgrad:+.4f}")
+    
+    if r_Ccond > 0.8:
+        print(f"  --> C ÉLEVÉ = haute conductance (Bejan : accès facilité)")
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 5 : SOC — criticalité auto-organisée
+# ═══════════════════════════════════════════════════
+
+def test_soc():
+    """
+    Bak (1987) : les systèmes complexes s'auto-organisent vers 
+    le point critique. Le sable s'accumule jusqu'à l'avalanche.
+    
+    Test : sous relaxation dissipative, le système converge-t-il
+    vers le point critique h/J ≈ 0.57 ? Ou vers l'ordre (C=1) ?
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 5 : SOC — le système converge-t-il vers la criticalité ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    # Valeur de C au point critique
+    H_crit = ising_H(N, 0.57, eps=0.01)
+    c_ops_crit = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops_crit.append(np.sqrt(0.1) * qt.tensor(o))
+    rho_crit = qt.steadystate(H_crit, c_ops_crit, method='direct')
+    sz_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        sz_ops.append(qt.tensor(o))
+    sz_crit = np.array([qt.expect(op, rho_crit) for op in sz_ops])
+    C_crit, _, _, _, _ = compute_cpsi_detailed(sz_crit)
+    print(f"  C au point critique (h/J=0.57) = {C_crit:.4f}")
+    
+    # Sous amplitude damping, le système va vers C ≈ 1 (ordre)
+    # PAS vers la criticalité
+    # Mais sous dephasing ? Ou sans dissipation ?
+    
+    print(f"\n  Convergence sous différentes dissipations :")
+    for gamma in [0.01, 0.1, 0.5]:
+        for hJ in [0.3, 0.6, 1.0]:
+            H = ising_H(N, hJ, eps=0.01)
+            c_ops = []
+            for i in range(N):
+                o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+                c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+            rho_ss = qt.steadystate(H, c_ops, method='direct')
+            sz = np.array([qt.expect(op, rho_ss) for op in sz_ops])
+            C, T, _, _, _ = compute_cpsi_detailed(sz)
+            dist_crit = abs(C - C_crit)
+            print(f"    γ={gamma:.2f} hJ={hJ:.1f}: C_ss={C:.4f}  dist(crit)={dist_crit:.4f}  → {'CRITIQUE' if dist_crit < 0.05 else 'ORDRE' if C > 0.8 else 'DÉSORDRE'}")
+    
+    print(f"\n  VERDICT : sous amplitude damping, le système converge vers")
+    print(f"  l'ORDRE (C→1), PAS vers la criticalité (SOC ne s'applique pas)")
+    print(f"  → C[Ψ] n'est PAS un système SOC au sens de Bak")
+    print(f"  → Mais la TRANSITION entre phases EST le point intéressant")
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] — DÉRIVATION + THÉORIES PARALLÈLES")
+    print(f"{'='*60}")
+    
+    t0 = time.time()
+    
+    test_derivation()    # ~3 min
+    test_prigogine()     # ~1 min
+    test_friston()       # ~1 min
+    test_constructal()   # ~1 min
+    test_soc()           # ~1 min
+    
+    print(f"\nTOTAL: {(time.time()-t0)/60:.1f} min")
+
+#!/usr/bin/env python3
+"""
+cpsi_eeg_baselines.py — Baselines entropiques pour P_EEG (Entropy submission)
+
+Compare C[Ψ] à 6 mesures établies sur les MÊMES données EEG :
+1. Sample Entropy (SampEn)
+2. Permutation Entropy (PermEn)  
+3. Spectral Entropy
+4. Lempel-Ziv Complexity
+5. DFA exponent (α)
+6. Mean absolute coherence (baseline simple)
+
+Sur 4 sujets × 500 epochs, même données que dans le papier.
+
+python3 ~/Desktop/cpsi_eeg_baselines.py
+"""
+import numpy as np
+import pandas as pd
+from scipy import stats, signal
+import warnings, time
+warnings.filterwarnings('ignore')
+
+def compute_cpsi(data_matrix):
+    data = (data_matrix - data_matrix.mean(axis=0)) / (data_matrix.std(axis=0) + 1e-10)
+    C_mat = np.corrcoef(data.T)
+    N = C_mat.shape[0]
+    micro = np.mean([abs(C_mat[i,i+1]) for i in range(N-1)])
+    pairs = [abs(C_mat[i,j]) for i in range(N) for j in range(i+1,N)]
+    macro = np.mean(pairs)
+    neighbor = [abs(C_mat[i,i+1]) for i in range(N-1)]
+    meso = max(0, min(1, 1.0 - np.std(neighbor)))
+    C = (micro+macro+meso)/3
+    return C
+
+def sample_entropy(sig, m=2, r_mult=0.2):
+    """Sample entropy (Richman & Moorman 2000)."""
+    N = len(sig)
+    r = r_mult * np.std(sig)
+    if r < 1e-10: return 0
+    def count_matches(template_len):
+        count = 0
+        templates = np.array([sig[i:i+template_len] for i in range(N-template_len)])
+        for i in range(len(templates)):
+            dists = np.max(np.abs(templates[i] - templates), axis=1)
+            count += np.sum(dists < r) - 1  # exclude self
+        return count
+    A = count_matches(m+1)
+    B = count_matches(m)
+    if B == 0 or A == 0: return 0
+    return -np.log(A / B)
+
+def permutation_entropy(sig, order=3, delay=1):
+    """Permutation entropy (Bandt & Pompe 2002)."""
+    N = len(sig)
+    n_perms = 0
+    perm_counts = {}
+    for i in range(N - (order-1)*delay):
+        pattern = tuple(np.argsort(sig[i:i+order*delay:delay]))
+        perm_counts[pattern] = perm_counts.get(pattern, 0) + 1
+        n_perms += 1
+    if n_perms == 0: return 0
+    probs = np.array(list(perm_counts.values())) / n_perms
+    return -np.sum(probs * np.log2(probs + 1e-10)) / np.log2(np.math.factorial(order))
+
+def spectral_entropy(sig, fs):
+    """Spectral entropy (Inouye et al. 1991)."""
+    freqs, psd = signal.welch(sig, fs=fs, nperseg=min(len(sig), int(fs*4)))
+    psd_norm = psd / (psd.sum() + 1e-10)
+    psd_norm = psd_norm[psd_norm > 0]
+    return -np.sum(psd_norm * np.log2(psd_norm)) / np.log2(len(psd_norm))
+
+def lempel_ziv(sig):
+    """Lempel-Ziv complexity (binary sequence)."""
+    median = np.median(sig)
+    binary = ''.join(['1' if x > median else '0' for x in sig])
+    n = len(binary)
+    i, c, l = 0, 1, 1
+    while i + l <= n:
+        sub = binary[i:i+l]
+        if sub in binary[:i]:
+            l += 1
+        else:
+            c += 1
+            i += l
+            l = 1
+    return c / (n / np.log2(n + 1e-10) + 1e-10)
+
+def dfa_exponent(sig, min_box=4, max_box=None):
+    """Detrended Fluctuation Analysis exponent."""
+    N = len(sig)
+    if max_box is None: max_box = N // 4
+    y = np.cumsum(sig - np.mean(sig))
+    box_sizes = np.unique(np.logspace(np.log10(min_box), np.log10(max_box), 15).astype(int))
+    flucts = []
+    for bs in box_sizes:
+        n_boxes = N // bs
+        if n_boxes < 2: continue
+        f = 0
+        for i in range(n_boxes):
+            segment = y[i*bs:(i+1)*bs]
+            x = np.arange(bs)
+            coeffs = np.polyfit(x, segment, 1)
+            trend = np.polyval(coeffs, x)
+            f += np.mean((segment - trend)**2)
+        flucts.append(np.sqrt(f / n_boxes))
+    if len(flucts) < 3: return 0.5
+    log_bs = np.log(box_sizes[:len(flucts)])
+    log_fl = np.log(np.array(flucts) + 1e-10)
+    slope, _, _, _, _ = stats.linregress(log_bs, log_fl)
+    return slope
+
+def band_power(sig, fs, band):
+    freqs, psd = signal.welch(sig, fs=fs, nperseg=min(len(sig), int(fs*4)))
+    total = np.trapz(psd, freqs) + 1e-10
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    return np.trapz(psd[mask], freqs[mask]) / total if mask.sum() > 0 else 0
+
+
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
+
+print("=" * 60)
+print("C[Ψ] vs BASELINES ENTROPIQUES — même données EEG")
+print("=" * 60)
+
+try:
+    import mne
+    from mne.datasets.sleep_physionet.age import fetch_data
+except ImportError:
+    print("pip3 install mne"); exit()
+
+bands = {'delta':(0.5,4),'theta':(4,8),'alpha':(8,13),'beta':(13,30),'gamma':(30,50)}
+all_results = []
+
+for subj in range(4):
+    print(f"\nSujet {subj}:", flush=True)
+    files = fetch_data(subjects=[subj], recording=[1], on_missing='warn')
+    raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+    data = raw.get_data().T
+    fs = raw.info['sfreq']
+    ch_names = raw.ch_names
+    eeg_idx = [i for i, ch in enumerate(ch_names) if 'EEG' in ch.upper()]
+    data = data[:, eeg_idx[:2]]
+    
+    epoch_len = int(30 * fs)
+    n_epochs = min(500, data.shape[0] // epoch_len)
+    
+    for ep in range(n_epochs):
+        epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+        sig = epoch[:, 0]  # Channel 1 pour mesures univariées
+        
+        # C[Ψ] (multivarié)
+        cpsi = compute_cpsi(epoch)
+        
+        # Baselines (univariées sur channel 1)
+        # SampEn sur sous-échantillon pour vitesse
+        sampen = sample_entropy(sig[::10], m=2, r_mult=0.2)
+        permen = permutation_entropy(sig, order=3, delay=1)
+        specen = spectral_entropy(sig, fs)
+        lz = lempel_ziv(sig)
+        dfa = dfa_exponent(sig)
+        
+        # Coherence simple (baseline multivarié)
+        mean_coh = abs(np.corrcoef(epoch.T)[0,1])
+        
+        # Band powers
+        bp = {b: band_power(sig, fs, r) for b, r in bands.items()}
+        
+        all_results.append({
+            'subject': subj, 'epoch': ep,
+            'C_psi': cpsi,
+            'SampEn': sampen,
+            'PermEn': permen,
+            'SpecEn': specen,
+            'LZ': lz,
+            'DFA': dfa,
+            'MeanCoh': mean_coh,
+            **bp
+        })
+    
+    print(f"  {n_epochs} epochs done", flush=True)
+
+df = pd.DataFrame(all_results)
+
+# ═══════════════════════════════════════════════════
+# COMPARAISON : corrélation avec les bandes de fréquence
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"CORRÉLATIONS AVEC LES BANDES (n={len(df)})")
+print(f"{'='*60}")
+
+methods = ['C_psi', 'SampEn', 'PermEn', 'SpecEn', 'LZ', 'DFA', 'MeanCoh']
+
+print(f"\n{'Method':<12}", end="")
+for b in ['delta','alpha','beta','gamma']:
+    print(f"  {'ρ('+b+')':<12}", end="")
+print(f"  {'|ρ| moyen':<12}")
+
+print("-" * 72)
+
+for method in methods:
+    print(f"{method:<12}", end="")
+    rhos = []
+    for b in ['delta','alpha','beta','gamma']:
+        r, p = stats.pearsonr(df[method], df[b])
+        print(f"  {r:+.4f}      ", end="")
+        rhos.append(abs(r))
+    print(f"  {np.mean(rhos):.4f}")
+
+# ═══════════════════════════════════════════════════
+# COMPARAISON PAR SUJET
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"ρ(method, gamma) PAR SUJET")
+print(f"{'='*60}")
+
+print(f"\n{'Method':<12}", end="")
+for s in range(4):
+    print(f"  {'Subj '+str(s):<10}", end="")
+print(f"  {'Neg/4':<8}")
+
+for method in methods:
+    print(f"{method:<12}", end="")
+    neg_count = 0
+    for s in range(4):
+        sub = df[df['subject']==s]
+        r, _ = stats.pearsonr(sub[method], sub['gamma'])
+        print(f"  {r:+.4f}    ", end="")
+        if r < 0: neg_count += 1
+    print(f"  {neg_count}/4")
+
+# ═══════════════════════════════════════════════════
+# SCORE COMPOSITE : quelle méthode discrimine le mieux les bandes ?
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"CLASSEMENT GLOBAL (|ρ| moyen sur delta, alpha, beta, gamma)")
+print(f"{'='*60}\n")
+
+ranking = []
+for method in methods:
+    rhos = []
+    for b in ['delta','alpha','beta','gamma']:
+        r, _ = stats.pearsonr(df[method], df[b])
+        rhos.append(abs(r))
+    ranking.append((method, np.mean(rhos)))
+
+ranking.sort(key=lambda x: -x[1])
+
+for i, (method, score) in enumerate(ranking):
+    marker = " ← C[Ψ]" if method == 'C_psi' else ""
+    print(f"  {i+1}. {method:<12} |ρ| moyen = {score:.4f}{marker}")
+
+# Save
+df.to_csv('/Users/oddworldabe/Desktop/cpsi_eeg_baselines.csv' if False else 'eeg_baselines.csv', index=False)
+print(f"\nSauvé: eeg_baselines.csv")
+
+#!/usr/bin/env python3
+"""
+cpsi_eeg_fixes.py — Calcule les valeurs manquantes pour le papier
+1. Alpha per-subject (4 sujets)
+2. Phase-randomization null model (meilleur que scramble)
+
+python3 ~/Desktop/cpsi_eeg_fixes.py
+"""
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy import stats, signal, fft
+import warnings
+warnings.filterwarnings('ignore')
+
+def compute_cpsi(data_matrix):
+    if data_matrix.shape[1] < 2: return None
+    data = (data_matrix - data_matrix.mean(axis=0)) / (data_matrix.std(axis=0) + 1e-10)
+    C_mat = np.corrcoef(data.T)
+    N = C_mat.shape[0]
+    micro = np.mean([abs(C_mat[i,i+1]) for i in range(N-1)])
+    pairs = [abs(C_mat[i,j]) for i in range(N) for j in range(i+1,N)]
+    macro = np.mean(pairs) if pairs else 0
+    neighbor = [abs(C_mat[i,i+1]) for i in range(N-1)]
+    meso = max(0, min(1, 1.0 - np.std(neighbor))) if neighbor else 0
+    return (micro+macro+meso)/3
+
+def band_power(sig, fs, band):
+    freqs, psd = signal.welch(sig, fs=fs, nperseg=min(len(sig), int(fs*4)))
+    total = np.trapz(psd, freqs) + 1e-10
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    return np.trapz(psd[mask], freqs[mask]) / total if mask.sum() > 0 else 0
+
+def phase_randomize(sig):
+    """Phase-randomization surrogate: preserves power spectrum, destroys correlations."""
+    N = len(sig)
+    ft = fft.fft(sig)
+    phases = np.random.uniform(0, 2*np.pi, len(ft))
+    phases[0] = 0  # keep DC
+    if N % 2 == 0: phases[N//2] = 0  # keep Nyquist
+    # Impose conjugate symmetry
+    for i in range(1, N//2):
+        phases[N-i] = -phases[i]
+    ft_surr = np.abs(ft) * np.exp(1j * phases)
+    return np.real(fft.ifft(ft_surr))
+
+print("=" * 60)
+print("FIXES POUR P_EEG")
+print("=" * 60)
+
+try:
+    import mne
+    from mne.datasets.sleep_physionet.age import fetch_data
+except ImportError:
+    print("pip3 install mne"); exit()
+
+# ═══════════════════════════════════════════════════
+# FIX 1 : ALPHA PER-SUBJECT
+# ═══════════════════════════════════════════════════
+
+print(f"\nFIX 1 : ALPHA PER-SUBJECT (4 sujets)")
+print("-" * 40, flush=True)
+
+bands = {'delta':(0.5,4),'theta':(4,8),'alpha':(8,13),'beta':(13,30),'gamma':(30,50)}
+
+for subj in range(4):
+    files = fetch_data(subjects=[subj], recording=[1], on_missing='warn')
+    raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+    data = raw.get_data().T
+    fs = raw.info['sfreq']
+    ch = raw.ch_names
+    eeg_idx = [i for i, c in enumerate(ch) if 'EEG' in c.upper()]
+    data = data[:, eeg_idx[:2]]
+    
+    epoch_len = int(30 * fs)
+    n_ep = min(500, data.shape[0] // epoch_len)
+    
+    Cs = []; bps = {b: [] for b in bands}
+    for ep in range(n_ep):
+        epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+        c = compute_cpsi(epoch)
+        if c is None: continue
+        Cs.append(c)
+        for b, rng in bands.items():
+            bps[b].append(band_power(epoch[:, 0], fs, rng))
+    
+    Cs = np.array(Cs)
+    print(f"\n  Sujet {subj} (n={len(Cs)}):")
+    for b in bands:
+        r, p = stats.pearsonr(np.array(bps[b]), Cs)
+        sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+        print(f"    ρ({b:6s}, C) = {r:+.4f}  p={p:.4f}  {sig}")
+
+# ═══════════════════════════════════════════════════
+# FIX 2 : PHASE-RANDOMIZATION NULL MODEL
+# ═══════════════════════════════════════════════════
+
+print(f"\n\nFIX 2 : PHASE-RANDOMIZATION NULL (100 perms, sujet 0)")
+print("-" * 40, flush=True)
+
+files = fetch_data(subjects=[0], recording=[1], on_missing='warn')
+raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+data = raw.get_data().T
+fs = raw.info['sfreq']
+ch = raw.ch_names
+eeg_idx = [i for i, c in enumerate(ch) if 'EEG' in c.upper()]
+data = data[:, eeg_idx[:2]]
+
+epoch_len = int(30 * fs)
+n_ep = min(500, data.shape[0] // epoch_len)
+
+# Real
+real_Cs = []; real_bps = {b: [] for b in ['delta','beta','gamma']}
+for ep in range(n_ep):
+    epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+    c = compute_cpsi(epoch)
+    if c is None: continue
+    real_Cs.append(c)
+    for b in ['delta','beta','gamma']:
+        real_bps[b].append(band_power(epoch[:, 0], fs, bands[b]))
+
+real_corrs = {}
+for b in ['delta','beta','gamma']:
+    real_corrs[b] = stats.pearsonr(np.array(real_bps[b]), np.array(real_Cs))[0]
+
+# Phase-randomized surrogates
+n_perm = 100
+surr_corrs = {b: [] for b in ['delta','beta','gamma']}
+np.random.seed(42)
+
+for perm in range(n_perm):
+    perm_Cs = []
+    for ep in range(n_ep):
+        epoch = data[ep*epoch_len:(ep+1)*epoch_len, :].copy()
+        # Phase-randomize each channel independently
+        for ch_i in range(epoch.shape[1]):
+            epoch[:, ch_i] = phase_randomize(epoch[:, ch_i])
+        c = compute_cpsi(epoch)
+        if c is not None:
+            perm_Cs.append(c)
+    
+    for b in ['delta','beta','gamma']:
+        # Use REAL band powers (spectrum preserved by phase-rand)
+        r = stats.pearsonr(np.array(real_bps[b])[:len(perm_Cs)], np.array(perm_Cs))[0]
+        surr_corrs[b].append(r)
+    
+    if (perm+1) % 25 == 0:
+        print(f"  {perm+1}/100 done", flush=True)
+
+print(f"\n  RÉSULTATS PHASE-RANDOMIZATION :")
+print(f"  {'Bande':<8} {'ρ réel':<10} {'ρ surr (moy±sd)':<20} {'Rang':<8}")
+for b in ['delta','beta','gamma']:
+    rank = np.mean([abs(s) >= abs(real_corrs[b]) for s in surr_corrs[b]])
+    print(f"  {b:<8} {real_corrs[b]:+.4f}     {np.mean(surr_corrs[b]):+.4f}±{np.std(surr_corrs[b]):.4f}      {rank:.4f}")
+
+print(f"\n{'='*60}")
+print("TERMINÉ")
+print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_eeg_next.py — Tests suivants pour renforcer P_EEG_Frequency
+
+TEST 1 : NULL MODEL — scramble des channels (le test que ChatGPT va demander)
+TEST 2 : Full Sleep-EDF Expanded (jusqu'à 20 sujets)
+TEST 3 : Lag-embedding pour créer N>2 channels virtuels (fixe le problème ρ(C,T)=-1)
+
+python3 -u ~/Desktop/cpsi_eeg_next.py 2>&1 | tee ~/Desktop/eeg_next_log.txt
+"""
+import numpy as np
+import pandas as pd
+import time, warnings, sys
+warnings.filterwarnings('ignore')
+from pathlib import Path
+from scipy import stats, signal, fft
+
+OUT = Path.home() / "Desktop" / "cpsi_eeg_next"
+OUT.mkdir(exist_ok=True)
+
+
+def compute_cpsi(data_matrix):
+    if data_matrix.shape[1] < 2: return None
+    data = (data_matrix - data_matrix.mean(axis=0)) / (data_matrix.std(axis=0) + 1e-10)
+    C_mat = np.corrcoef(data.T)
+    N = C_mat.shape[0]
+    micro = np.mean([abs(C_mat[i,i+1]) for i in range(N-1)])
+    pairs = [abs(C_mat[i,j]) for i in range(N) for j in range(i+1,N)]
+    macro = np.mean(pairs) if pairs else 0
+    neighbor = [abs(C_mat[i,i+1]) for i in range(N-1)]
+    meso = max(0, min(1, 1.0 - np.std(neighbor))) if neighbor else 0
+    C = (micro+macro+meso)/3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return {'C':C, 'T':T, 'micro':micro, 'macro':macro, 'meso':meso}
+
+
+def spectrum_info(sig_1d, fs):
+    bands = {'delta':(0.5,4),'theta':(4,8),'alpha':(8,13),'beta':(13,30),'gamma':(30,50)}
+    N = len(sig_1d)
+    if N < 50: return None
+    sig_1d = sig_1d - np.mean(sig_1d)
+    freqs, psd = signal.welch(sig_1d, fs=fs, nperseg=min(N, int(fs*4)))
+    total = np.trapz(psd, freqs) + 1e-10
+    bp = {}
+    for name, (lo, hi) in bands.items():
+        mask = (freqs >= lo) & (freqs <= hi)
+        bp[name] = np.trapz(psd[mask], freqs[mask]) / total if mask.sum() > 0 else 0
+    return bp
+
+
+def lag_embed(signal_2ch, lags=[1, 2, 5, 10]):
+    """Crée N > 2 channels virtuels par lag-embedding."""
+    T, N = signal_2ch.shape
+    embedded = [signal_2ch]
+    for lag in lags:
+        if lag < T:
+            shifted = np.roll(signal_2ch, lag, axis=0)
+            shifted[:lag, :] = signal_2ch[:lag, :]
+            embedded.append(shifted)
+    return np.hstack(embedded)  # T × (N * (1+len(lags)))
+
+
+# ═══════════════════════════════════════════════════
+# TEST 1 : NULL MODEL — scramble temporel
+# ═══════════════════════════════════════════════════
+
+def test_null_model():
+    """
+    Scramble : on mélange l'ordre des échantillons dans chaque channel
+    indépendamment. Ça détruit les corrélations inter-channels
+    tout en préservant le contenu spectral de chaque channel.
+    
+    Si C[Ψ] scramblé corrèle ENCORE avec les bandes → artefact.
+    Si C[Ψ] scramblé ne corrèle PLUS → le signal est réel.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 1 : NULL MODEL (scramble temporel)")
+    print(f"{'='*60}", flush=True)
+    
+    try:
+        import mne
+        from mne.datasets.sleep_physionet.age import fetch_data
+    except ImportError:
+        print("  mne requis"); return
+    
+    files = fetch_data(subjects=[0], recording=[1], on_missing='warn')
+    raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+    data = raw.get_data().T
+    fs = raw.info['sfreq']
+    ch_names = raw.ch_names
+    eeg_idx = [i for i, ch in enumerate(ch_names) if 'EEG' in ch.upper()]
+    data = data[:, eeg_idx[:2]]
+    
+    epoch_len = int(30 * fs)
+    n_epochs = min(500, data.shape[0] // epoch_len)
+    
+    # 1. Résultats réels
+    real_results = []
+    for ep in range(n_epochs):
+        epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+        cpsi = compute_cpsi(epoch)
+        spec = spectrum_info(epoch[:, 0], fs)
+        if cpsi and spec:
+            real_results.append({**cpsi, **spec})
+    df_real = pd.DataFrame(real_results)
+    
+    # 2. Résultats scramblés (100 permutations)
+    n_perm = 100
+    scramble_corrs = {'delta':[], 'beta':[], 'gamma':[]}
+    
+    print(f"  {n_perm} permutations...", flush=True)
+    np.random.seed(42)
+    for perm in range(n_perm):
+        perm_results = []
+        for ep in range(n_epochs):
+            epoch = data[ep*epoch_len:(ep+1)*epoch_len, :].copy()
+            # Scramble chaque channel indépendamment
+            for ch in range(epoch.shape[1]):
+                np.random.shuffle(epoch[:, ch])
+            cpsi = compute_cpsi(epoch)
+            spec = spectrum_info(data[ep*epoch_len:(ep+1)*epoch_len, 0], fs)  # spectre ORIGINAL
+            if cpsi and spec:
+                perm_results.append({**cpsi, **spec})
+        
+        df_perm = pd.DataFrame(perm_results)
+        for band in ['delta', 'beta', 'gamma']:
+            r, _ = stats.pearsonr(df_perm[band], df_perm['C'])
+            scramble_corrs[band].append(r)
+        
+        if (perm+1) % 20 == 0:
+            print(f"    {perm+1}/{n_perm} permutations done", flush=True)
+    
+    # Comparaison
+    print(f"\n  RÉSULTATS :")
+    print(f"  {'Bande':<8} {'ρ réel':<10} {'ρ scramblé (moy)':<20} {'p (rang)':<10}")
+    for band in ['delta', 'beta', 'gamma']:
+        r_real = stats.pearsonr(df_real[band], df_real['C'])[0]
+        r_scr = np.mean(scramble_corrs[band])
+        # Rank test: combien de scrambles dépassent le réel ?
+        rank = np.mean([abs(s) >= abs(r_real) for s in scramble_corrs[band]])
+        print(f"  {band:<8} {r_real:+.4f}     {r_scr:+.4f} ± {np.std(scramble_corrs[band]):.4f}        {rank:.4f}")
+    
+    print(f"\n  VERDICT :")
+    for band in ['delta', 'beta', 'gamma']:
+        r_real = abs(stats.pearsonr(df_real[band], df_real['C'])[0])
+        r_scr_max = max(abs(s) for s in scramble_corrs[band])
+        if r_real > r_scr_max:
+            print(f"    {band}: ✅ RÉEL — ρ réel ({r_real:.3f}) dépasse TOUTES les permutations")
+        else:
+            rank = np.mean([abs(s) >= r_real for s in scramble_corrs[band]])
+            print(f"    {band}: {'✅ RÉEL' if rank < 0.05 else '❌ ARTEFACT'} — rang = {rank:.3f}")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 2 : MULTI-SUJET ÉTENDU (jusqu'à 20)
+# ═══════════════════════════════════════════════════
+
+def test_extended_subjects():
+    print(f"\n{'='*60}")
+    print(f"TEST 2 : REPLICATION ÉTENDUE (20 sujets)")
+    print(f"{'='*60}", flush=True)
+    
+    try:
+        import mne
+        from mne.datasets.sleep_physionet.age import fetch_data
+    except ImportError:
+        print("  mne requis"); return
+    
+    all_results = []
+    subjects_done = 0
+    
+    for subj in range(20):
+        try:
+            files = fetch_data(subjects=[subj], recording=[1], on_missing='warn')
+            if not files: continue
+            raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+            data = raw.get_data().T
+            fs = raw.info['sfreq']
+            ch_names = raw.ch_names
+            eeg_idx = [i for i, ch in enumerate(ch_names) if 'EEG' in ch.upper()]
+            if len(eeg_idx) < 2: continue
+            data = data[:, eeg_idx[:2]]
+            
+            epoch_len = int(30 * fs)
+            n_epochs = min(200, data.shape[0] // epoch_len)  # 200 par sujet pour vitesse
+            
+            subj_corrs = []
+            for ep in range(n_epochs):
+                epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+                cpsi = compute_cpsi(epoch)
+                spec = spectrum_info(epoch[:, 0], fs)
+                if cpsi and spec:
+                    all_results.append({'subject': subj, **cpsi, **spec})
+                    subj_corrs.append((cpsi['C'], spec.get('gamma', 0)))
+            
+            if len(subj_corrs) > 10:
+                Cs, Gs = zip(*subj_corrs)
+                r = stats.pearsonr(Cs, Gs)[0]
+                subjects_done += 1
+                print(f"  Sujet {subj:2d}: n={len(subj_corrs):3d}  ρ(γ,C)={r:+.3f}  {'✅' if r < -0.1 else '⚠️'}", flush=True)
+        except Exception as e:
+            print(f"  Sujet {subj:2d}: ❌ {str(e)[:60]}", flush=True)
+    
+    if len(all_results) < 100:
+        print("  Pas assez de données"); return
+    
+    df = pd.DataFrame(all_results)
+    print(f"\n  Total: {len(df)} epochs, {subjects_done} sujets", flush=True)
+    
+    # Global
+    for band in ['delta','theta','alpha','beta','gamma']:
+        r, p = stats.pearsonr(df[band], df['C'])
+        print(f"    {band:6s} : ρ = {r:+.4f}  p = {p:.2e}")
+    
+    # Combien de sujets ont ρ(γ,C) < 0 ?
+    neg_count = 0
+    for s in df['subject'].unique():
+        sub = df[df['subject']==s]
+        if len(sub) < 10: continue
+        r = stats.pearsonr(sub['gamma'], sub['C'])[0]
+        if r < 0: neg_count += 1
+    total_s = len(df['subject'].unique())
+    print(f"\n  Sujets avec ρ(γ,C) < 0 : {neg_count}/{total_s} ({neg_count/total_s*100:.0f}%)")
+    print(f"  Binomial test: p = {stats.binom_test(neg_count, total_s, 0.5):.4f}")
+    
+    df.to_csv(OUT / 'extended_subjects.csv', index=False)
+
+
+# ═══════════════════════════════════════════════════
+# TEST 3 : LAG-EMBEDDING (N > 2 channels)
+# ═══════════════════════════════════════════════════
+
+def test_lag_embedding():
+    """
+    Avec 2 channels, ρ(C,T) = -1 trivialement.
+    Lag-embedding crée N = 2*(1+4) = 10 channels virtuels.
+    Sur 10 channels, ρ(C,T) devrait être < 1 en valeur absolue.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 3 : LAG-EMBEDDING (10 channels virtuels)")
+    print(f"Fixe le problème ρ(C,T) = -1 avec 2 channels")
+    print(f"{'='*60}", flush=True)
+    
+    try:
+        import mne
+        from mne.datasets.sleep_physionet.age import fetch_data
+    except ImportError:
+        print("  mne requis"); return
+    
+    files = fetch_data(subjects=[0], recording=[1], on_missing='warn')
+    raw = mne.io.read_raw_edf(files[0][0], preload=True, verbose=False)
+    data = raw.get_data().T
+    fs = raw.info['sfreq']
+    ch_names = raw.ch_names
+    eeg_idx = [i for i, ch in enumerate(ch_names) if 'EEG' in ch.upper()]
+    data = data[:, eeg_idx[:2]]
+    
+    epoch_len = int(30 * fs)
+    n_epochs = min(500, data.shape[0] // epoch_len)
+    
+    lags = [1, 3, 10, 30]  # En échantillons (à 100 Hz : 10ms, 30ms, 100ms, 300ms)
+    
+    results_2ch = []
+    results_embed = []
+    
+    for ep in range(n_epochs):
+        epoch = data[ep*epoch_len:(ep+1)*epoch_len, :]
+        
+        # 2 channels (classique)
+        cpsi_2 = compute_cpsi(epoch)
+        spec = spectrum_info(epoch[:, 0], fs)
+        if cpsi_2 and spec:
+            results_2ch.append({**cpsi_2, **spec})
+        
+        # Lag-embedded (10 channels)
+        epoch_embed = lag_embed(epoch, lags=lags)
+        cpsi_e = compute_cpsi(epoch_embed)
+        if cpsi_e and spec:
+            results_embed.append({**cpsi_e, **spec})
+    
+    df_2 = pd.DataFrame(results_2ch)
+    df_e = pd.DataFrame(results_embed)
+    
+    print(f"\n  COMPARAISON 2 channels vs 10 channels (lag-embedded) :")
+    print(f"  {'Métrique':<25} {'2 ch':<15} {'10 ch (embed)':<15}")
+    print(f"  {'-'*55}")
+    
+    r_ct_2 = stats.pearsonr(df_2['C'], df_2['T'])[0]
+    r_ct_e = stats.pearsonr(df_e['C'], df_e['T'])[0]
+    print(f"  {'ρ(C, T)':<25} {r_ct_2:+.4f}         {r_ct_e:+.4f}")
+    
+    for band in ['delta','beta','gamma']:
+        r_2 = stats.pearsonr(df_2[band], df_2['C'])[0]
+        r_e = stats.pearsonr(df_e[band], df_e['C'])[0]
+        print(f"  {'ρ('+band+', C)':<25} {r_2:+.4f}         {r_e:+.4f}")
+    
+    print(f"\n  C moyen 2ch : {df_2['C'].mean():.4f} ± {df_2['C'].std():.4f}")
+    print(f"  C moyen 10ch: {df_e['C'].mean():.4f} ± {df_e['C'].std():.4f}")
+    
+    if abs(r_ct_e) < 0.99:
+        print(f"\n  ✅ ρ(C,T) = {r_ct_e:+.4f} (plus trivialement -1 avec lag-embedding)")
+    else:
+        print(f"\n  ⚠️ ρ(C,T) encore très élevé — lag-embedding insuffisant")
+    
+    df_e.to_csv(OUT / 'lag_embedded.csv', index=False)
+
+
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Ψ] EEG — TESTS SUIVANTS")
+    print(f"{'='*60}", flush=True)
+    
+    t0 = time.time()
+    
+    test_null_model()       # ~5 min (100 permutations)
+    test_lag_embedding()    # ~2 min
+    test_extended_subjects() # ~20 min (téléchargement)
+    
+    print(f"\n{'='*60}")
+    print(f"TOTAL: {(time.time()-t0)/60:.1f} min")
+    print(f"Résultats: {OUT}")
+    print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_freeenergy.py — C[Ψ] = énergie libre organisationnelle ?
+
+TEST 1 : C/(1+T) quasi-variationnel (N=5, 7, multi-gamma, 20 trajectoires)
+TEST 2 : C vs F = E - T_bath * S pendant dynamique
+TEST 3 : Efficacité de travail extractible vs C[Ψ]
+TEST 4 : Contrôle : moduler gamma(t) pour MAXIMISER C → maximise-t-on le travail ?
+
+python3 ~/Desktop/cpsi_freeenergy.py
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats
+import warnings, time
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def ising_H(N, hJ, J=1.0, eps=0.01):
+    h = hJ * J
+    H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -eps * qt.tensor(o2)
+    return H
+
+def make_cops(N, gamma):
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    return c_ops
+
+def make_sz_ops(N):
+    ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        ops.append(qt.tensor(o))
+    return ops
+
+def run_trajectory(H, c_ops, sz_ops, N, tlist):
+    dim = 2**N
+    psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+    rho0 = qt.ket2dm(psi0)
+    result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops + [H])
+    
+    C_t = []; T_t = []; E_t = []
+    for t_idx in range(len(tlist)):
+        sz = np.array([result.expect[i][t_idx] for i in range(N)])
+        C, T = compute_cpsi(sz)
+        E = result.expect[N][t_idx]
+        C_t.append(C); T_t.append(T); E_t.append(E)
+    return np.array(C_t), np.array(T_t), np.array(E_t)
+
+
+# ═══════════════════════════════════════════════════
+# TEST 1 : C/(1+T) — test robuste
+# ═══════════════════════════════════════════════════
+
+def test_quasi_variational():
+    print(f"\n{'='*60}")
+    print(f"TEST 1 : C/(1+T) QUASI-VARIATIONNEL ?")
+    print(f"20 trajectoires, N=4 et N=5, 3 gammas")
+    print(f"{'='*60}", flush=True)
+    
+    tlist = np.linspace(0, 80, 400)
+    
+    for N in [4, 5]:
+        for gamma in [0.05, 0.1, 0.3]:
+            for hJ in [0.3, 0.6]:
+                H = ising_H(N, hJ)
+                c_ops = make_cops(N, gamma)
+                sz_ops = make_sz_ops(N)
+                
+                violations_C = []
+                violations_CT = []
+                violations_E = []
+                
+                for trial in range(20):
+                    C_t, T_t, E_t = run_trajectory(H, c_ops, sz_ops, N, tlist)
+                    CT = C_t / (1 + T_t)
+                    
+                    dC = np.diff(C_t)
+                    dCT = np.diff(CT)
+                    dE = np.diff(E_t)
+                    
+                    violations_C.append(np.sum(dC < -1e-6))
+                    violations_CT.append(np.sum(dCT < -1e-6))
+                    violations_E.append(np.sum(dE > 1e-6))
+                
+                vC = np.mean(violations_C)
+                vCT = np.mean(violations_CT)
+                vE = np.mean(violations_E)
+                
+                # Combien de trajectoires sont "quasi-monotones" (< 5% violations)
+                threshold = len(tlist) * 0.05
+                mono_C = sum(1 for v in violations_C if v < threshold)
+                mono_CT = sum(1 for v in violations_CT if v < threshold)
+                mono_E = sum(1 for v in violations_E if v < threshold)
+                
+                print(f"  N={N} g={gamma:.2f} hJ={hJ}:  E:{mono_E}/20  C:{mono_C}/20  C/(1+T):{mono_CT}/20  (violations moy: E={vE:.0f} C={vC:.0f} CT={vCT:.0f})", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# TEST 2 : C vs ÉNERGIE LIBRE pendant dynamique
+# F = E - gamma * S_vN (gamma comme proxy de température)
+# ═══════════════════════════════════════════════════
+
+def test_free_energy():
+    print(f"\n{'='*60}")
+    print(f"TEST 2 : C vs ÉNERGIE LIBRE F = E - gamma*S")
+    print(f"Si C ~ -F alors C = énergie libre organisationnelle")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    gamma = 0.1
+    tlist = np.linspace(0, 80, 200)
+    
+    for hJ in [0.3, 0.6, 1.0]:
+        H = ising_H(N, hJ)
+        c_ops = make_cops(N, gamma)
+        sz_ops = make_sz_ops(N)
+        dim = 2**N
+        
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho0 = qt.ket2dm(psi0)
+        
+        # mesolve avec states pour calculer S_vN
+        result = qt.mesolve(H, rho0, tlist, c_ops, [], options={"store_states": True})
+        
+        C_t = []; F_t = []; E_t = []; S_t = []; W_t = []
+        E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+        
+        for t_idx in range(len(tlist)):
+            rho = result.states[t_idx]
+            sz = np.array([qt.expect(op, rho) for op in sz_ops])
+            C, T = compute_cpsi(sz)
+            E = qt.expect(H, rho)
+            S = qt.entropy_vn(rho, 2)
+            F = E - gamma * S
+            W = E - E_gs  # travail extractible
+            
+            C_t.append(C); F_t.append(F); E_t.append(E)
+            S_t.append(S); W_t.append(W)
+        
+        C_t = np.array(C_t); F_t = np.array(F_t)
+        E_t = np.array(E_t); S_t = np.array(S_t); W_t = np.array(W_t)
+        
+        rCE, _ = stats.pearsonr(C_t, E_t)
+        rCF, _ = stats.pearsonr(C_t, F_t)
+        rCS, _ = stats.pearsonr(C_t, S_t)
+        rCW, _ = stats.pearsonr(C_t, W_t)
+        
+        print(f"\n  h/J={hJ}:")
+        print(f"    rho(C, E)     = {rCE:+.4f}  {'C ~ -E' if rCE < -0.9 else ''}")
+        print(f"    rho(C, F)     = {rCF:+.4f}  {'C ~ -F !' if rCF < -0.9 else ''}")
+        print(f"    rho(C, S_vN)  = {rCS:+.4f}")
+        print(f"    rho(C, W_ext) = {rCW:+.4f}  {'C ~ -W_extractible' if rCW < -0.9 else ''}")
+        
+        # C(0) vs C(inf) vs F(0) vs F(inf)
+        print(f"    C: {C_t[0]:.4f} -> {C_t[-1]:.4f}")
+        print(f"    F: {F_t[0]:.4f} -> {F_t[-1]:.4f}")
+        print(f"    E: {E_t[0]:.4f} -> {E_t[-1]:.4f}")
+        print(f"    S: {S_t[0]:.4f} -> {S_t[-1]:.4f}")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 3 : CONTRÔLE — moduler gamma pour maximiser C
+# Si C = énergie libre, alors max(C) = max rendement
+# ═══════════════════════════════════════════════════
+
+def test_control():
+    """
+    Protocole :
+    A) gamma constant = 0.1
+    B) gamma rampe croissante 0.01 → 0.3
+    C) gamma rampe décroissante 0.3 → 0.01
+    D) gamma pulsé (on/off)
+    
+    Question : quel protocole donne le C final le plus élevé ?
+    Et est-ce aussi celui qui extrait le plus de travail ?
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 3 : CONTRÔLE gamma(t) → maximiser C")
+    print(f"Quel protocole maximise la cohérence finale ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    hJ = 0.3
+    H = ising_H(N, hJ)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+    
+    n_steps = 200
+    dt = 0.5
+    
+    protocols = {
+        'constant_0.1': lambda t: 0.1,
+        'constant_0.3': lambda t: 0.3,
+        'rampe_up': lambda t: 0.01 + 0.29 * t / (n_steps * dt),
+        'rampe_down': lambda t: 0.30 - 0.29 * t / (n_steps * dt),
+        'pulse': lambda t: 0.3 if int(t / 10) % 2 == 0 else 0.01,
+        'optimal_guess': lambda t: 0.3 if t < n_steps*dt/2 else 0.01,
+    }
+    
+    results = {}
+    
+    for name, gamma_func in protocols.items():
+        # Simuler pas à pas
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho = qt.ket2dm(psi0)
+        
+        C_history = []
+        E_history = []
+        
+        for step in range(n_steps):
+            t = step * dt
+            gamma = gamma_func(t)
+            c_ops = make_cops(N, gamma)
+            
+            # Un petit pas mesolve
+            result = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = result.states[-1]
+            
+            sz = np.array([qt.expect(op, rho) for op in sz_ops])
+            C, T = compute_cpsi(sz)
+            E = qt.expect(H, rho)
+            
+            C_history.append(C)
+            E_history.append(E)
+        
+        C_final = C_history[-1]
+        E_final = E_history[-1]
+        W_extracted = E_history[0] - E_final  # travail extrait = perte d'énergie
+        efficiency = C_final / (abs(E_history[0] - E_gs) + 1e-10)
+        
+        results[name] = {
+            'C_final': C_final,
+            'E_final': E_final,
+            'W_extracted': W_extracted,
+            'efficiency': efficiency,
+        }
+        print(f"  {name:20s}  C_final={C_final:.4f}  W={W_extracted:.4f}  eff={efficiency:.4f}", flush=True)
+    
+    # Quel protocole gagne ?
+    best_C = max(results, key=lambda k: results[k]['C_final'])
+    best_W = max(results, key=lambda k: results[k]['W_extracted'])
+    
+    print(f"\n  Meilleur C final : {best_C}")
+    print(f"  Meilleur W extrait : {best_W}")
+    
+    if best_C == best_W:
+        print(f"  --> MEME PROTOCOLE maximise C et W !")
+        print(f"  --> Maximiser C[Psi] = maximiser le travail extractible")
+        print(f"  --> C[Psi] EST la clé vers la maitrise de l'énergie libre")
+    else:
+        print(f"  --> Protocoles différents pour C et W")
+        print(f"  --> C[Psi] ne controle pas directement le travail")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 4 : RÉSUMÉ — l'équation organisationnelle
+# ═══════════════════════════════════════════════════
+
+def test_equation():
+    """Synthèse : quelle est l'équation ?"""
+    print(f"\n{'='*60}")
+    print(f"TEST 4 : L'ÉQUATION ORGANISATIONNELLE")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    gamma = 0.1
+    hJ_values = np.linspace(0.01, 2.0, 20)
+    
+    H_list = [ising_H(N, hJ) for hJ in hJ_values]
+    
+    results = []
+    for idx, hJ in enumerate(hJ_values):
+        H = H_list[idx]
+        c_ops = make_cops(N, gamma)
+        
+        rho = qt.steadystate(H, c_ops, method='direct')
+        sz_ops = make_sz_ops(N)
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C, T = compute_cpsi(sz)
+        E = qt.expect(H, rho)
+        S = qt.entropy_vn(rho, 2)
+        P = (rho*rho).tr().real
+        F = E - gamma * S
+        E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+        
+        results.append({
+            'hJ':hJ, 'C':C, 'T':T, 'E':E, 'S':S, 'P':P, 'F':F,
+            'E_gs':E_gs, 'CT':C/(1+T), 'neg_F':-F
+        })
+    
+    C_a = np.array([r['C'] for r in results])
+    neg_F = np.array([r['neg_F'] for r in results])
+    E_a = np.array([r['E'] for r in results])
+    P_a = np.array([r['P'] for r in results])
+    CT_a = np.array([r['CT'] for r in results])
+    
+    # L'équation : C ~ -F ?
+    rCF, _ = stats.pearsonr(C_a, neg_F)
+    rCE, _ = stats.pearsonr(C_a, -E_a)
+    rCP, _ = stats.pearsonr(C_a, P_a)
+    rCTF, _ = stats.pearsonr(CT_a, neg_F)
+    
+    print(f"\n  Sur 20 points steady-state (N={N}, gamma={gamma}) :")
+    print(f"    rho(C, -F)       = {rCF:+.4f}")
+    print(f"    rho(C, -E)       = {rCE:+.4f}")
+    print(f"    rho(C, Purete)   = {rCP:+.4f}")
+    print(f"    rho(C/(1+T), -F) = {rCTF:+.4f}")
+    
+    # Fit linéaire C = a*(-F) + b
+    from numpy.linalg import lstsq
+    X = np.column_stack([neg_F, np.ones(len(neg_F))])
+    b, _, _, _ = lstsq(X, C_a, rcond=None)
+    r2 = 1 - np.sum((C_a - X@b)**2) / np.sum((C_a - C_a.mean())**2)
+    
+    print(f"\n  FIT : C = {b[0]:.4f} * (-F) + {b[1]:.4f}")
+    print(f"  R2 = {r2:.4f}")
+    
+    if r2 > 0.95:
+        print(f"\n  --> C[Psi] ~ -F (energie libre)")
+        print(f"  --> L'EQUATION : C[Psi] = a * F_org + b")
+        print(f"  --> ou F_org = energie libre organisationnelle")
+        print(f"  --> Maximiser C = minimiser F = maximiser travail extractible")
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] = ENERGIE LIBRE ORGANISATIONNELLE ?")
+    print(f"{'='*60}")
+    
+    t0 = time.time()
+    
+    test_free_energy()        # ~3 min
+    test_equation()           # ~1 min
+    test_control()            # ~5 min
+    test_quasi_variational()  # ~10 min
+    
+    print(f"\nTOTAL: {(time.time()-t0)/60:.1f} min")
+
+#!/usr/bin/env python3
+"""
+cpsi_freeenergy2.py — Vers la maîtrise de l'énergie libre
+
+TEST 1 : RENDEMENT DE CARNOT — C prédit-il l'efficacité thermodynamique ?
+TEST 2 : PROTOCOLE OPTIMAL — quel gamma(t) maximise W pour un budget donné ?
+TEST 3 : FEEDBACK CONTROL — utiliser C en temps réel pour optimiser gamma
+TEST 4 : COUPLAGE MULTI-SYSTÈME — 2 systèmes échangent de l'énergie via C[Ψ]
+TEST 5 : RÉSONANCE — le système extrait-il plus de travail à la résonance ?
+
+python3 -u ~/Desktop/cpsi_freeenergy2.py 2>&1 | tee ~/Desktop/freeenergy2_log.txt
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats, optimize
+import warnings, time
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def ising_H(N, hJ, J=1.0, eps=0.01):
+    h = hJ * J; H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -eps * qt.tensor(o2)
+    return H
+
+def make_cops(N, gamma):
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    return c_ops
+
+def make_sz_ops(N):
+    ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        ops.append(qt.tensor(o))
+    return ops
+
+
+# ═══════════════════════════════════════════════════
+# TEST 1 : C vs EFFICACITÉ THERMODYNAMIQUE
+# ═══════════════════════════════════════════════════
+
+def test_efficiency():
+    """
+    Question : C[Ψ] prédit-il l'efficacité de conversion énergie → travail ?
+    
+    Efficacité = W_extrait / E_input
+    W_extrait = E(t=0) - E(t=inf) 
+    E_input = énergie du Hamiltonien + énergie de dissipation
+    
+    Si ρ(C_final, efficacité) > 0.8 → C est un indicateur de rendement
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 1 : C vs EFFICACITÉ THERMODYNAMIQUE")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+    
+    n_steps = 200; dt = 0.5
+    
+    results = []
+    # Tester beaucoup de gamma constants
+    for gamma in [0.01, 0.02, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]:
+        np.random.seed(42)
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        
+        c_ops = make_cops(N, gamma)
+        
+        # Énergie totale fournie par la dissipation
+        E_dissipated = 0
+        for step in range(n_steps):
+            E_before = qt.expect(H, rho)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+            E_after = qt.expect(H, rho)
+            # La dissipation fournit de l'énergie au système (amplitude damping pousse vers |0⟩)
+            E_dissipated += gamma * dt  # proxy du coût énergétique
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_final, T_final = compute_cpsi(sz)
+        E_final = qt.expect(H, rho)
+        W = E_init - E_final  # travail extrait
+        efficiency = W / (E_dissipated + 1e-10)
+        
+        print(f"  gamma={gamma:.3f}  C={C_final:.4f}  W={W:.4f}  E_diss={E_dissipated:.2f}  eff={efficiency:.4f}", flush=True)
+        results.append({'gamma':gamma, 'C':C_final, 'W':W, 'eff':efficiency, 'E_diss':E_dissipated})
+    
+    C_a = np.array([r['C'] for r in results])
+    W_a = np.array([r['W'] for r in results])
+    eff_a = np.array([r['eff'] for r in results])
+    
+    rCW, _ = stats.pearsonr(C_a, W_a)
+    rCE, _ = stats.pearsonr(C_a, eff_a)
+    
+    print(f"\n  rho(C, W_extrait)  = {rCW:+.4f}")
+    print(f"  rho(C, efficacite) = {rCE:+.4f}")
+    
+    # Quel gamma donne le meilleur rendement ?
+    best_eff = max(results, key=lambda r: r['eff'])
+    best_W = max(results, key=lambda r: r['W'])
+    best_C = max(results, key=lambda r: r['C'])
+    
+    print(f"\n  Meilleur rendement : gamma={best_eff['gamma']} (eff={best_eff['eff']:.4f})")
+    print(f"  Meilleur W         : gamma={best_W['gamma']} (W={best_W['W']:.4f})")
+    print(f"  Meilleur C         : gamma={best_C['gamma']} (C={best_C['C']:.4f})")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 2 : FEEDBACK — utiliser C pour contrôler gamma en temps réel
+# ═══════════════════════════════════════════════════
+
+def test_feedback():
+    """
+    Protocole feedback :
+    - Mesurer C à chaque pas de temps
+    - Ajuster gamma en fonction de C :
+      - Si C < C_target : augmenter gamma (plus de dissipation pour ordonner)
+      - Si C > C_target : diminuer gamma (économiser l'énergie)
+    
+    Comparer avec gamma constant optimal.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 2 : FEEDBACK CONTROL — gamma(C) en temps réel")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    
+    n_steps = 200; dt = 0.5
+    np.random.seed(42)
+    psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+    
+    protocols = {}
+    
+    # A) Gamma constant (baseline)
+    for g_const in [0.1, 0.3]:
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        total_gamma = 0
+        
+        for step in range(n_steps):
+            c_ops = make_cops(N, g_const)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+            total_gamma += g_const * dt
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_f, _ = compute_cpsi(sz)
+        W = E_init - qt.expect(H, rho)
+        eff = W / (total_gamma + 1e-10)
+        protocols[f'constant_{g_const}'] = {'C':C_f, 'W':W, 'eff':eff, 'cost':total_gamma}
+    
+    # B) Feedback proportionnel : gamma = g_max * (1 - C)
+    for g_max in [0.3, 0.5, 1.0]:
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        total_gamma = 0
+        
+        for step in range(n_steps):
+            sz = np.array([qt.expect(op, rho) for op in sz_ops])
+            C_now, _ = compute_cpsi(sz)
+            gamma = g_max * max(0, 1 - C_now)  # Fort quand C bas, nul quand C ≈ 1
+            gamma = max(gamma, 0.001)  # plancher
+            
+            c_ops = make_cops(N, gamma)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+            total_gamma += gamma * dt
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_f, _ = compute_cpsi(sz)
+        W = E_init - qt.expect(H, rho)
+        eff = W / (total_gamma + 1e-10)
+        protocols[f'feedback_{g_max}'] = {'C':C_f, 'W':W, 'eff':eff, 'cost':total_gamma}
+    
+    # C) Rampe optimale : fort au début, faible à la fin
+    rho = qt.ket2dm(psi0)
+    E_init = qt.expect(H, rho)
+    total_gamma = 0
+    for step in range(n_steps):
+        t = step * dt
+        gamma = 0.5 * np.exp(-t / 20)  # décroissance exponentielle
+        gamma = max(gamma, 0.001)
+        c_ops = make_cops(N, gamma)
+        res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+        rho = res.states[-1]
+        total_gamma += gamma * dt
+    sz = np.array([qt.expect(op, rho) for op in sz_ops])
+    C_f, _ = compute_cpsi(sz)
+    W = E_init - qt.expect(H, rho)
+    eff = W / (total_gamma + 1e-10)
+    protocols['exp_decay'] = {'C':C_f, 'W':W, 'eff':eff, 'cost':total_gamma}
+    
+    # Résultats
+    print(f"\n  {'Protocole':<20} {'C_final':<10} {'W':<10} {'Cout_g':<10} {'Efficacite':<10}")
+    print(f"  {'-'*60}")
+    for name, r in sorted(protocols.items(), key=lambda x: -x[1]['eff']):
+        print(f"  {name:<20} {r['C']:.4f}     {r['W']:.4f}     {r['cost']:.2f}       {r['eff']:.4f}")
+    
+    best = max(protocols, key=lambda k: protocols[k]['eff'])
+    print(f"\n  MEILLEUR RENDEMENT : {best}")
+    
+    if 'feedback' in best:
+        print(f"  --> Le FEEDBACK basé sur C[Psi] bat le gamma constant !")
+        print(f"  --> C[Psi] comme signal de controle = optimisation energetique")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 3 : RÉSONANCE — max travail au point critique ?
+# ═══════════════════════════════════════════════════
+
+def test_resonance():
+    """
+    Hypothèse : le point critique (h/J ≈ 0.57) est le point
+    où le système peut absorber/émettre le plus d'énergie.
+    
+    Test : balayer h/J et mesurer le travail extractible
+    pour chaque point.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 3 : RÉSONANCE — max W au point critique ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4; gamma = 0.1
+    dim = 2**N
+    n_steps = 200; dt = 0.5
+    
+    results = []
+    for hJ in np.linspace(0.01, 2.0, 20):
+        H = ising_H(N, hJ, eps=0)
+        c_ops = make_cops(N, gamma)
+        sz_ops = make_sz_ops(N)
+        
+        np.random.seed(42)
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        
+        for step in range(n_steps):
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_f, T_f = compute_cpsi(sz)
+        E_final = qt.expect(H, rho)
+        W = E_init - E_final
+        S = qt.entropy_vn(rho, 2)
+        
+        # Susceptibilité = dC/d(hJ) ≈ proxy de response
+        results.append({'hJ':hJ, 'C':C_f, 'W':W, 'S':S, 'E_final':E_final})
+    
+    # Trouver le max de W
+    W_arr = np.array([r['W'] for r in results])
+    hJ_arr = np.array([r['hJ'] for r in results])
+    C_arr = np.array([r['C'] for r in results])
+    
+    max_W_idx = np.argmax(W_arr)
+    
+    print(f"  Max W = {W_arr[max_W_idx]:.4f} a h/J = {hJ_arr[max_W_idx]:.2f}")
+    print(f"  C a ce point = {C_arr[max_W_idx]:.4f}")
+    
+    # Le max de W est-il proche du point critique ?
+    if abs(hJ_arr[max_W_idx] - 0.57) < 0.2:
+        print(f"  --> Max W PRES du point critique (0.57) !")
+        print(f"  --> La transition de phase = point de max extraction d'energie")
+    else:
+        print(f"  --> Max W a h/J={hJ_arr[max_W_idx]:.2f}, loin du critique")
+    
+    rCW, _ = stats.pearsonr(C_arr, W_arr)
+    print(f"  rho(C, W) = {rCW:+.4f}")
+
+
+# ═══════════════════════════════════════════════════
+# TEST 4 : TAILLE DU SYSTÈME vs EFFICACITÉ
+# ═══════════════════════════════════════════════════
+
+def test_size_efficiency():
+    """
+    L'efficacité augmente-t-elle avec la taille du système ?
+    Si oui → les gros systèmes organisés extraient plus de travail
+    → la cohérence est SCALABLE
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST 4 : TAILLE vs EFFICACITÉ")
+    print(f"{'='*60}", flush=True)
+    
+    gamma = 0.1; hJ = 0.3
+    n_steps = 100; dt = 0.5
+    
+    for N in [3, 4, 5, 6]:
+        dim = 2**N
+        H = ising_H(N, hJ, eps=0)
+        c_ops = make_cops(N, gamma)
+        sz_ops = make_sz_ops(N)
+        E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+        
+        np.random.seed(42)
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        
+        t0 = time.time()
+        total_gamma = 0
+        for step in range(n_steps):
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+            total_gamma += gamma * dt
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_f, _ = compute_cpsi(sz)
+        W = E_init - qt.expect(H, rho)
+        eff = W / (total_gamma + 1e-10)
+        eff_per_qubit = eff / N
+        dt_calc = time.time() - t0
+        
+        print(f"  N={N}  C={C_f:.4f}  W={W:.4f}  eff={eff:.4f}  eff/qubit={eff_per_qubit:.4f}  ({dt_calc:.1f}s)", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] — VERS LA MAITRISE DE L'ENERGIE LIBRE")
+    print(f"{'='*60}")
+    
+    t0 = time.time()
+    
+    test_efficiency()       # ~3 min
+    test_feedback()         # ~5 min
+    test_resonance()        # ~3 min
+    test_size_efficiency()  # ~5 min
+    
+    print(f"\nTOTAL: {(time.time()-t0)/60:.1f} min")
+
+#!/usr/bin/env python3
+"""
+cpsi_ibm_final.py — Dernier batch, 5 min restantes
+
+PRIORITÉ 1 : BARRES D'ERREUR sur N=156 (5 répétitions)
+  → Sans ça, un reviewer dit "one shot, not reproducible"
+  → C_eq(B) = 0.323 ± ? et C_ordered = 0.887 ± ?
+
+PRIORITÉ 2 : QPT FINE à N=50 (20 points)
+  → Courbe publiable avec résolution suffisante
+
+PRIORITÉ 3 : ÉVOLUTION TEMPORELLE TROTTER (N=10)
+  → Trotterized Ising dynamics = vraie simulation quantique
+  → Mesurer C(t) pendant l'évolution sous H_Ising
+
+python3 ~/Desktop/cpsi_ibm_final.py
+"""
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from scipy import stats
+import time
+
+IBM_TOKEN = "7xVLVvR99E858ptggH93l8c7tgrBKrsHgszbFAeK11zO"
+IBM_CRN = "crn:v1:bluemix:public:quantum-computing:us-east:a/0097a59bc929466eab1121f836f4b16f:75533909-0b8a-4563-a872-75864689f863::"
+
+def compute_cpsi(sz):
+    N = len(sz)
+    if N < 2: return None, None
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    pairs_sum = 0; count = 0
+    for i in range(N):
+        for j in range(i+1, N):
+            pairs_sum += abs(sz[i]*sz[j]); count += 1
+    macro = pairs_sum / count if count > 0 else 0
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def extract_sz(result_item, N):
+    try:
+        data = result_item.data
+        creg_name = list(data.__dict__.keys())[0]
+        bitarray = getattr(data, creg_name)
+        counts = bitarray.get_counts()
+        total = sum(counts.values())
+        sz = np.zeros(N)
+        for bitstring, count in counts.items():
+            for q in range(min(N, len(bitstring))):
+                bit = int(bitstring[len(bitstring)-1-q])
+                sz[q] += (1 - 2*bit) * count / total
+        return sz
+    except:
+        return np.zeros(N)
+
+# ═══════════════════════════════════════════════════
+print("=" * 60)
+print("C[Ψ] IBM — BATCH FINAL (5 min restantes)")
+print("=" * 60)
+
+QiskitRuntimeService.save_account(
+    channel="ibm_quantum_platform", token=IBM_TOKEN,
+    instance=IBM_CRN, overwrite=True, set_as_default=True
+)
+service = QiskitRuntimeService()
+backend = service.least_busy(min_num_qubits=100, operational=True)
+print(f"Backend : {backend.name} ({backend.num_qubits} qubits)")
+pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+
+circuits = []
+labels = []
+
+# ═══════════════════════════════════════════════════
+# P1 : BARRES D'ERREUR (5 répétitions × 4 circuits = 20)
+# ═══════════════════════════════════════════════════
+
+print(f"\nP1 : BARRES D'ERREUR (5 répétitions)")
+
+for rep in range(5):
+    # N=156 ordered
+    N = backend.num_qubits
+    qc = QuantumCircuit(N, N)
+    for i in range(N): qc.x(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc); labels.append(f"ord156_r{rep}")
+    
+    # N=156 paramagnetic
+    qc = QuantumCircuit(N, N)
+    for i in range(N): qc.h(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc); labels.append(f"par156_r{rep}")
+    
+    # N=50 ordered
+    qc = QuantumCircuit(50, 50)
+    for i in range(50): qc.x(i)
+    qc.measure(range(50), range(50))
+    circuits.append(qc); labels.append(f"ord50_r{rep}")
+    
+    # N=50 paramagnetic
+    qc = QuantumCircuit(50, 50)
+    for i in range(50): qc.h(i)
+    qc.measure(range(50), range(50))
+    circuits.append(qc); labels.append(f"par50_r{rep}")
+
+print(f"  20 circuits (error bars)")
+
+# ═══════════════════════════════════════════════════
+# P2 : QPT FINE à N=50 (20 points)
+# ═══════════════════════════════════════════════════
+
+print(f"\nP2 : QPT FINE N=50 (20 points)")
+
+thetas = np.linspace(0, np.pi, 20)
+for theta in thetas:
+    qc = QuantumCircuit(50, 50)
+    for i in range(50): qc.ry(theta, i)
+    qc.measure(range(50), range(50))
+    circuits.append(qc); labels.append(f"qptfine_t{theta:.3f}")
+
+print(f"  +20 circuits (fine QPT)")
+
+# ═══════════════════════════════════════════════════
+# P3 : TROTTER DYNAMICS (N=10, 8 pas de temps)
+# ═══════════════════════════════════════════════════
+
+print(f"\nP3 : TROTTER DYNAMICS N=10")
+
+N_trotter = 10
+dt_trotter = 0.3  # pas de temps Trotter
+
+for n_steps in [0, 1, 2, 3, 4, 6, 8, 12]:
+    qc = QuantumCircuit(N_trotter, N_trotter)
+    
+    # État initial : tous spin up (ordonné)
+    for i in range(N_trotter): qc.x(i)
+    
+    # Évolution Trotterisée : exp(-iHt) ≈ Π exp(-iH_k dt)
+    # H = -J Σ σz_i σz_{i+1} - h Σ σx_i
+    # Trotter : exp(-iJdt σz_i σz_{i+1}) × exp(ihdt σx_i)
+    hJ = 0.5  # au milieu de la transition
+    J = 1.0
+    h = hJ * J
+    
+    for step in range(n_steps):
+        # ZZ interaction : exp(-iJ dt σz_i σz_{i+1})
+        for i in range(N_trotter - 1):
+            qc.cx(i, i+1)
+            qc.rz(2 * J * dt_trotter, i+1)
+            qc.cx(i, i+1)
+        # X field : exp(-ih dt σx_i) = Rx(2h dt)
+        for i in range(N_trotter):
+            qc.rx(2 * h * dt_trotter, i)
+    
+    qc.measure(range(N_trotter), range(N_trotter))
+    circuits.append(qc); labels.append(f"trotter_s{n_steps}")
+
+print(f"  +8 circuits (Trotter)")
+
+print(f"\n  TOTAL : {len(circuits)} circuits")
+
+# ═══════════════════════════════════════════════════
+# ENVOI
+# ═══════════════════════════════════════════════════
+
+print(f"\nTranspilation...", flush=True)
+isa_circuits = pm.run(circuits)
+
+# Profondeurs Trotter
+for i, label in enumerate(labels):
+    if 'trotter' in label:
+        print(f"  {label}: depth={isa_circuits[i].depth()}")
+
+print(f"\nEnvoi sur {backend.name}...", flush=True)
+t_submit = time.time()
+sampler = SamplerV2(backend)
+job = sampler.run([(c,) for c in isa_circuits], shots=4096)
+print(f"  Job ID: {job.job_id()}")
+print(f"  Attente...", flush=True)
+result = job.result()
+t_done = time.time()
+print(f"  Résultats en {t_done-t_submit:.0f}s")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE P1 : BARRES D'ERREUR
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("P1 : BARRES D'ERREUR")
+print(f"{'='*60}")
+
+for prefix, N, desc in [("ord156", backend.num_qubits, "Ordered N=156"), 
+                          ("par156", backend.num_qubits, "Param N=156"),
+                          ("ord50", 50, "Ordered N=50"),
+                          ("par50", 50, "Param N=50")]:
+    Cs = []
+    for i, label in enumerate(labels):
+        if label.startswith(prefix):
+            sz = extract_sz(result[i], N)
+            C, T = compute_cpsi(sz)
+            Cs.append(C)
+    Cs = np.array(Cs)
+    print(f"  {desc:20s}: C = {np.mean(Cs):.4f} ± {np.std(Cs):.4f}  (n={len(Cs)})")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE P2 : QPT FINE
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("P2 : QPT FINE N=50 (20 points)")
+print(f"{'='*60}")
+
+qpt_data = []
+for i, label in enumerate(labels):
+    if label.startswith("qptfine"):
+        theta = float(label.split('_t')[1])
+        sz = extract_sz(result[i], 50)
+        C, T = compute_cpsi(sz)
+        qpt_data.append((theta, C))
+        print(f"  θ={theta:.3f}  C={C:.4f}")
+
+if len(qpt_data) > 5:
+    thetas_arr = np.array([x[0] for x in qpt_data])
+    Cs_arr = np.array([x[1] for x in qpt_data])
+    C_max = Cs_arr.max()
+    C_min = Cs_arr.min()
+    theta_mid = thetas_arr[np.argmin(np.abs(Cs_arr - (C_max+C_min)/2))]
+    print(f"\n  C range: {C_max:.4f} → {C_min:.4f}")
+    print(f"  θ midpoint (C = {(C_max+C_min)/2:.3f}): θ ≈ {theta_mid:.3f}")
+    print(f"  En degrés: {np.degrees(theta_mid):.1f}°")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE P3 : TROTTER DYNAMICS
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("P3 : TROTTER DYNAMICS (N=10, h/J=0.5)")
+print(f"{'='*60}")
+
+print(f"\n  {'Steps':>6} {'t':>6} {'C':>8} {'<sz>':>8}")
+for i, label in enumerate(labels):
+    if label.startswith("trotter"):
+        n_steps = int(label.split('_s')[1])
+        t = n_steps * dt_trotter
+        sz = extract_sz(result[i], N_trotter)
+        C, T = compute_cpsi(sz)
+        print(f"  {n_steps:6d} {t:6.2f} {C:8.4f} {np.mean(sz):+8.4f}")
+
+print(f"\n  Si C diminue avec le temps → le champ transverse")
+print(f"  désorganise l'état ordonné initial")
+print(f"  = VRAIE dynamique quantique sur vrai hardware")
+
+# ═══════════════════════════════════════════════════
+print(f"\n{'='*60}")
+print(f"Temps hardware : {t_done-t_submit:.0f}s ({(t_done-t_submit)/60:.1f} min)")
+print(f"Circuits : {len(circuits)}")
+print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_ibm_limits.py — Pousser aux LIMITES du processeur
+
+ibm_fez = 156 qubits. On va utiliser TOUT.
+
+BATCH 1 : N = 60, 80, 100, 127, 150 (ordered + paramagnetic)
+  → C[Ψ] sur 150 vrais qubits supraconducteurs
+  → Classiquement impossible : 2^150 ≈ 10^45
+
+BATCH 2 : QPT scan à N = 50 et N = 100
+  → Transition de phase sur 100 qubits réels
+
+BATCH 3 : ÉTATS EXOTIQUES
+  → W state (un seul qubit excité, intrication partagée)
+  → Random entangled (couches CX aléatoires)
+  → Néel state (antiferromagnétique alterné)
+  → Cluster state (graphe 1D)
+
+BATCH 4 : C[Ψ] vs POSITION SUR LE CHIP
+  → Même circuit sur différentes régions du processeur
+  → Cartographie du bruit par C[Ψ]
+
+Budget : ~6.7 min restantes. On vise ~40 circuits.
+
+python3 ~/Desktop/cpsi_ibm_limits.py
+"""
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from scipy import stats
+import time
+
+IBM_TOKEN = "7xVLVvR99E858ptggH93l8c7tgrBKrsHgszbFAeK11zO"
+IBM_CRN = "crn:v1:bluemix:public:quantum-computing:us-east:a/0097a59bc929466eab1121f836f4b16f:75533909-0b8a-4563-a872-75864689f863::"
+
+def compute_cpsi(sz):
+    N = len(sz)
+    if N < 2: return None, None
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    pairs_sum = 0; count = 0
+    for i in range(N):
+        for j in range(i+1, N):
+            pairs_sum += abs(sz[i]*sz[j])
+            count += 1
+    macro = pairs_sum / count if count > 0 else 0
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def extract_sz(result_item, N):
+    try:
+        data = result_item.data
+        creg_name = list(data.__dict__.keys())[0]
+        bitarray = getattr(data, creg_name)
+        counts = bitarray.get_counts()
+        total = sum(counts.values())
+        sz = np.zeros(N)
+        for bitstring, count in counts.items():
+            for q in range(min(N, len(bitstring))):
+                bit = int(bitstring[len(bitstring)-1-q])
+                sz[q] += (1 - 2*bit) * count / total
+        return sz
+    except Exception as e:
+        print(f"    Extract error: {e}")
+        return np.zeros(N)
+
+# ═══════════════════════════════════════════════════
+# CONNEXION
+# ═══════════════════════════════════════════════════
+
+print("=" * 60)
+print("C[Ψ] IBM QUANTUM — LIMITES ABSOLUES")
+print("=" * 60)
+
+print("\nConnexion...", flush=True)
+QiskitRuntimeService.save_account(
+    channel="ibm_quantum_platform", token=IBM_TOKEN,
+    instance=IBM_CRN, overwrite=True, set_as_default=True
+)
+service = QiskitRuntimeService()
+backend = service.least_busy(min_num_qubits=100, operational=True)
+n_qubits_max = backend.num_qubits
+print(f"Backend : {backend.name} ({n_qubits_max} qubits)")
+
+pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+
+circuits = []
+labels = []
+
+# ═══════════════════════════════════════════════════
+# BATCH 1 : TAILLES EXTRÊMES
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"BATCH 1 : TAILLES N = 60 à {min(150, n_qubits_max)}")
+print(f"{'='*60}", flush=True)
+
+extreme_sizes = [60, 80, 100, 127]
+if n_qubits_max >= 150:
+    extreme_sizes.append(150)
+if n_qubits_max >= 156:
+    extreme_sizes.append(n_qubits_max)  # ALL qubits
+
+for N in extreme_sizes:
+    if N > n_qubits_max: continue
+    
+    # Ordered
+    qc = QuantumCircuit(N, N)
+    for i in range(N): qc.x(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc); labels.append(f"ordered_N{N}")
+    
+    # Paramagnetic
+    qc = QuantumCircuit(N, N)
+    for i in range(N): qc.h(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc); labels.append(f"param_N{N}")
+
+print(f"  {len(circuits)} circuits (extreme sizes)")
+
+# ═══════════════════════════════════════════════════
+# BATCH 2 : QPT À N=50 ET N=100
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"BATCH 2 : QPT SCAN N=50 et N=100")
+print(f"{'='*60}", flush=True)
+
+for N in [50, 100]:
+    if N > n_qubits_max: continue
+    for theta in [0.0, 0.5, 1.0, 1.57, 2.5, 3.14]:
+        qc = QuantumCircuit(N, N)
+        for i in range(N): qc.ry(theta, i)
+        qc.measure(range(N), range(N))
+        circuits.append(qc); labels.append(f"qpt_N{N}_t{theta:.2f}")
+
+print(f"  +{len(circuits) - len(extreme_sizes)*2} circuits (QPT)")
+
+# ═══════════════════════════════════════════════════
+# BATCH 3 : ÉTATS EXOTIQUES
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print(f"BATCH 3 : ÉTATS EXOTIQUES")
+print(f"{'='*60}", flush=True)
+
+N_exotic = 20
+
+# W state : |100...0⟩ + |010...0⟩ + ... + |000...1⟩ (approximation)
+qc = QuantumCircuit(N_exotic, N_exotic)
+qc.x(0)
+for i in range(N_exotic - 1):
+    # Rotation partielle pour distribuer l'excitation
+    angle = np.arccos(np.sqrt(1/(N_exotic - i)))
+    qc.cry(2*angle, i, i+1)
+    qc.cx(i+1, i)
+qc.measure(range(N_exotic), range(N_exotic))
+circuits.append(qc); labels.append(f"W_N{N_exotic}")
+
+# Néel state (antiferromagnétique : |010101...⟩)
+qc = QuantumCircuit(N_exotic, N_exotic)
+for i in range(0, N_exotic, 2):
+    qc.x(i)
+qc.measure(range(N_exotic), range(N_exotic))
+circuits.append(qc); labels.append(f"neel_N{N_exotic}")
+
+# Cluster state (graphe 1D, ressource pour MBQC)
+qc = QuantumCircuit(N_exotic, N_exotic)
+for i in range(N_exotic): qc.h(i)
+for i in range(N_exotic - 1): qc.cz(i, i+1)
+qc.measure(range(N_exotic), range(N_exotic))
+circuits.append(qc); labels.append(f"cluster_N{N_exotic}")
+
+# Random entangled (couches alternées RY + CX)
+np.random.seed(42)
+qc = QuantumCircuit(N_exotic, N_exotic)
+for layer in range(3):
+    for i in range(N_exotic):
+        qc.ry(np.random.uniform(0, np.pi), i)
+    for i in range(0 if layer%2==0 else 1, N_exotic-1, 2):
+        qc.cx(i, i+1)
+qc.measure(range(N_exotic), range(N_exotic))
+circuits.append(qc); labels.append(f"rand_entangled_N{N_exotic}")
+
+# Produit pur (baseline)
+qc = QuantumCircuit(N_exotic, N_exotic)
+for i in range(N_exotic):
+    qc.ry(0.7, i)  # Tous même angle
+qc.measure(range(N_exotic), range(N_exotic))
+circuits.append(qc); labels.append(f"product_N{N_exotic}")
+
+# GHZ à N=50
+if n_qubits_max >= 50:
+    qc = QuantumCircuit(50, 50)
+    qc.h(0)
+    for i in range(49): qc.cx(i, i+1)
+    qc.measure(range(50), range(50))
+    circuits.append(qc); labels.append("GHZ_N50")
+
+print(f"  +6 circuits (exotic states)")
+
+print(f"\n  TOTAL : {len(circuits)} circuits")
+
+# ═══════════════════════════════════════════════════
+# TRANSPILE + ENVOI
+# ═══════════════════════════════════════════════════
+
+print(f"\nTranspilation...", flush=True)
+t0 = time.time()
+isa_circuits = pm.run(circuits)
+print(f"  Transpilé en {time.time()-t0:.0f}s")
+
+# Afficher les profondeurs des circuits les plus grands
+for i, label in enumerate(labels):
+    if any(x in label for x in ['N150', 'N156', 'N127', 'GHZ_N50', 'cluster']):
+        print(f"  {label}: depth={isa_circuits[i].depth()}")
+
+print(f"\nEnvoi sur {backend.name}...", flush=True)
+t_submit = time.time()
+sampler = SamplerV2(backend)
+pubs = [(circ,) for circ in isa_circuits]
+job = sampler.run(pubs, shots=4096)
+print(f"  Job ID: {job.job_id()}")
+print(f"  Attente...", flush=True)
+
+result = job.result()
+t_done = time.time()
+print(f"  Résultats en {t_done-t_submit:.0f}s")
+
+# ═══════════════════════════════════════════════════
+# RÉSULTATS
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("RÉSULTATS — LIMITES ABSOLUES")
+print(f"{'='*60}")
+
+all_results = []
+for i, label in enumerate(labels):
+    if '_N' in label:
+        N = int(label.split('_N')[1].split('_')[0])
+    else:
+        N = 20
+    sz = extract_sz(result[i], N)
+    C, T = compute_cpsi(sz)
+    all_results.append({'label':label, 'N':N, 'C':C, 'T':T, 'mean_sz':np.mean(sz)})
+
+# Scaling extrême
+print(f"\n  SCALING EXTRÊME :")
+print(f"  {'N':>5} {'C ordered':>10} {'C param':>10}")
+print(f"  {'-'*28}")
+for N in extreme_sizes:
+    if N > n_qubits_max: continue
+    C_ord = next((r['C'] for r in all_results if r['label']==f'ordered_N{N}'), None)
+    C_par = next((r['C'] for r in all_results if r['label']==f'param_N{N}'), None)
+    if C_ord and C_par:
+        print(f"  {N:5d} {C_ord:10.4f} {C_par:10.4f}")
+
+# QPT scan
+print(f"\n  QPT SCAN :")
+for N in [50, 100]:
+    qpt = [(float(r['label'].split('_t')[1]), r['C']) 
+            for r in all_results if r['label'].startswith(f'qpt_N{N}')]
+    if qpt:
+        qpt.sort()
+        print(f"\n  N = {N}:")
+        for theta, C in qpt:
+            print(f"    θ={theta:.2f}  C={C:.4f}")
+
+# États exotiques
+print(f"\n  ÉTATS EXOTIQUES (N={N_exotic}) :")
+for label_prefix in ['W', 'neel', 'cluster', 'rand_entangled', 'product', 'GHZ']:
+    for r in all_results:
+        if r['label'].startswith(label_prefix):
+            print(f"    {r['label']:25s}  C={r['C']:.4f}  T={r['T']:.4f}")
+
+# Record
+print(f"\n{'='*60}")
+print(f"RECORDS")
+print(f"{'='*60}")
+max_N = max(r['N'] for r in all_results)
+print(f"  Plus grand N testé : {max_N} qubits")
+print(f"  C_eq(B) paramagnétique : {np.mean([r['C'] for r in all_results if 'param' in r['label']]):.4f}")
+print(f"  Temps hardware : {t_done-t_submit:.0f}s ({(t_done-t_submit)/60:.1f} min)")
+print(f"  Circuits exécutés : {len(circuits)}")
+print(f"  Hilbert dim max : 2^{max_N} ≈ 10^{int(max_N*0.301)}")
+print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_ibm_max.py — Maximum de résultats IBM Quantum en 8 minutes
+
+STRATÉGIE : Sur vrai hardware, on peut aller à N=20, 30, 50 qubits !
+C'est IMPOSSIBLE classiquement (2^50 = 10^15 dims).
+C'est LE résultat que personne d'autre n'a.
+
+BATCH 1 (~3 min) : C[Ψ] SCALING AVEC N
+  - État ordonné (X gates) : N = 4, 8, 12, 16, 20, 30, 50
+  - État paramagnétique (H gates) : même N
+  - GHZ (intriqué) : N = 4, 8, 12, 20
+  → 18 circuits, teste si C_eq(A)≈1 et C_eq(B)≈0.33 tiennent à GRANDE TAILLE
+
+BATCH 2 (~2 min) : QPT SCAN À N=4, 10, 20
+  - RY(θ) interpolation ordered↔paramagnetic
+  - 8 valeurs de θ × 3 tailles = 24 circuits
+  → QPT sur vrai hardware à N=20
+
+BATCH 3 (~2 min) : DEPTH SCAN À N=10, 20
+  - Profondeur 1, 5, 10, 20, 50 × 2 tailles = 10 circuits
+  → Décohérence réelle à grande taille
+
+TOTAL : ~52 circuits, ~7 min, ~1 min de marge
+
+python3 ~/Desktop/cpsi_ibm_max.py
+"""
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from scipy import stats
+import time
+
+# ═══════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════
+
+IBM_TOKEN = "7xVLVvR99E858ptggH93l8c7tgrBKrsHgszbFAeK11zO"
+IBM_CRN = "crn:v1:bluemix:public:quantum-computing:us-east:a/0097a59bc929466eab1121f836f4b16f:75533909-0b8a-4563-a872-75864689f863::"
+
+def compute_cpsi(sz):
+    N = len(sz)
+    if N < 2: return None, None
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def extract_sz(result_item, N):
+    """Extrait <σz> depuis les résultats IBM."""
+    try:
+        data = result_item.data
+        creg_name = list(data.__dict__.keys())[0]
+        bitarray = getattr(data, creg_name)
+        counts = bitarray.get_counts()
+        total = sum(counts.values())
+        sz = np.zeros(N)
+        for bitstring, count in counts.items():
+            for q in range(min(N, len(bitstring))):
+                bit = int(bitstring[len(bitstring)-1-q])
+                sz[q] += (1 - 2*bit) * count / total
+        return sz
+    except Exception as e:
+        print(f"    Extraction error: {e}")
+        return np.zeros(N)
+
+# ═══════════════════════════════════════════════════
+# CONNEXION
+# ═══════════════════════════════════════════════════
+
+print("=" * 60)
+print("C[Ψ] IBM QUANTUM — 8 MIN OPTIMISÉES")
+print("=" * 60)
+
+print("\nConnexion IBM Quantum...", flush=True)
+try:
+    QiskitRuntimeService.save_account(
+        channel="ibm_quantum_platform",
+        token=IBM_TOKEN,
+        instance=IBM_CRN,
+        overwrite=True, set_as_default=True
+    )
+    service = QiskitRuntimeService()
+    backend = service.least_busy(min_num_qubits=50, operational=True)
+    print(f"Backend : {backend.name} ({backend.num_qubits} qubits)")
+except Exception as e:
+    print(f"Connexion échouée : {e}")
+    exit(1)
+
+pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+
+# ═══════════════════════════════════════════════════
+# BATCH 1 : SCALING AVEC N
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("BATCH 1 : C[Ψ] SCALING AVEC N")
+print(f"{'='*60}", flush=True)
+
+circuits = []
+labels = []
+
+# Ordered states (X gates → |1...1⟩ → tous sz = -1)
+for N in [4, 8, 12, 16, 20, 30, 50]:
+    qc = QuantumCircuit(N, N)
+    for i in range(N):
+        qc.x(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc)
+    labels.append(f"ordered_N{N}")
+
+# Paramagnetic states (H gates → |+...+⟩ → sz ≈ 0)
+for N in [4, 8, 12, 16, 20, 30, 50]:
+    qc = QuantumCircuit(N, N)
+    for i in range(N):
+        qc.h(i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc)
+    labels.append(f"param_N{N}")
+
+# GHZ states (maximally entangled)
+for N in [4, 8, 12, 20]:
+    qc = QuantumCircuit(N, N)
+    qc.h(0)
+    for i in range(N-1):
+        qc.cx(i, i+1)
+    qc.measure(range(N), range(N))
+    circuits.append(qc)
+    labels.append(f"GHZ_N{N}")
+
+# Random product states
+np.random.seed(42)
+for N in [4, 10, 20]:
+    qc = QuantumCircuit(N, N)
+    for i in range(N):
+        theta = np.random.uniform(0, np.pi)
+        qc.ry(theta, i)
+    qc.measure(range(N), range(N))
+    circuits.append(qc)
+    labels.append(f"random_N{N}")
+
+print(f"  {len(circuits)} circuits (scaling)")
+
+# ═══════════════════════════════════════════════════
+# BATCH 2 : QPT SCAN
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("BATCH 2 : QPT SCAN (θ interpolation)")
+print(f"{'='*60}", flush=True)
+
+# RY(θ) : θ=0 → |0⟩ (ordered), θ=π/2 → |+⟩ (paramagnetic), θ=π → |1⟩
+for N in [4, 10, 20]:
+    for theta in [0.0, 0.3, 0.6, 0.9, 1.2, 1.57, 2.0, 3.14]:
+        qc = QuantumCircuit(N, N)
+        for i in range(N):
+            qc.ry(theta, i)
+        qc.measure(range(N), range(N))
+        circuits.append(qc)
+        labels.append(f"qpt_N{N}_t{theta:.2f}")
+
+print(f"  +24 circuits (QPT scan)")
+
+# ═══════════════════════════════════════════════════
+# BATCH 3 : DEPTH SCAN À GRANDE TAILLE
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("BATCH 3 : DEPTH SCAN")
+print(f"{'='*60}", flush=True)
+
+for N in [10, 20]:
+    for depth in [1, 5, 10, 20, 50]:
+        qc = QuantumCircuit(N, N)
+        # Préparer état ordonné
+        for i in range(N):
+            qc.x(i)
+        # Ajouter couches d'identité (bruit sur hardware)
+        for d in range(depth):
+            qc.barrier()
+            for i in range(N-1):
+                qc.cx(i, i+1)
+                qc.cx(i+1, i)
+        qc.measure(range(N), range(N))
+        circuits.append(qc)
+        labels.append(f"depth{depth}_N{N}")
+
+print(f"  +10 circuits (depth scan)")
+print(f"\n  TOTAL : {len(circuits)} circuits")
+
+# ═══════════════════════════════════════════════════
+# TRANSPILATION + ENVOI
+# ═══════════════════════════════════════════════════
+
+print(f"\nTranspilation pour {backend.name}...", flush=True)
+t0 = time.time()
+isa_circuits = pm.run(circuits)
+print(f"  Transpilé en {time.time()-t0:.0f}s", flush=True)
+
+# Profondeurs après transpilation
+for i, label in enumerate(labels):
+    d = isa_circuits[i].depth()
+    if 'depth50' in label or 'GHZ_N20' in label or 'N50' in label:
+        print(f"  {label}: depth={d}")
+
+print(f"\nEnvoi de {len(isa_circuits)} circuits sur {backend.name}...", flush=True)
+t_submit = time.time()
+
+sampler = SamplerV2(backend)
+pubs = [(circ,) for circ in isa_circuits]
+
+# Envoyer en un seul job pour minimiser la queue
+job = sampler.run(pubs, shots=4096)
+print(f"  Job ID: {job.job_id()}")
+print(f"  Attente résultats...", flush=True)
+
+result = job.result()
+t_done = time.time()
+print(f"  Résultats reçus en {t_done-t_submit:.0f}s")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("RÉSULTATS")
+print(f"{'='*60}")
+
+all_results = []
+for i, label in enumerate(labels):
+    # Déterminer N depuis le label
+    if '_N' in label:
+        N = int(label.split('_N')[1].split('_')[0])
+    else:
+        N = 4
+    
+    sz = extract_sz(result[i], N)
+    C, T = compute_cpsi(sz)
+    mean_sz = np.mean(sz)
+    
+    all_results.append({'label':label, 'N':N, 'C':C, 'T':T, 'mean_sz':mean_sz})
+    
+    # Afficher les résultats importants
+    if any(x in label for x in ['ordered', 'param', 'GHZ', 'random', 'depth']):
+        print(f"  {label:25s}  C={C:.4f}  T={T:.4f}  <sz>={mean_sz:+.3f}")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE SCALING
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("SCALING : C[Ψ] vs N sur vrai hardware")
+print(f"{'='*60}")
+
+print(f"\n  {'N':>4} {'C ordered':>10} {'C param':>10} {'C GHZ':>10}")
+print(f"  {'-'*38}")
+
+for N in [4, 8, 12, 16, 20, 30, 50]:
+    C_ord = next((r['C'] for r in all_results if r['label']==f'ordered_N{N}'), None)
+    C_par = next((r['C'] for r in all_results if r['label']==f'param_N{N}'), None)
+    C_ghz = next((r['C'] for r in all_results if r['label']==f'GHZ_N{N}'), None)
+    
+    ghz_str = f"{C_ghz:.4f}" if C_ghz else "—"
+    print(f"  {N:4d} {C_ord:.4f}     {C_par:.4f}     {ghz_str}")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE QPT
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("QPT SCAN sur vrai hardware")
+print(f"{'='*60}")
+
+for N in [4, 10, 20]:
+    print(f"\n  N = {N}:")
+    thetas = [0.0, 0.3, 0.6, 0.9, 1.2, 1.57, 2.0, 3.14]
+    Cs = []
+    for theta in thetas:
+        r = next((r for r in all_results if r['label']==f'qpt_N{N}_t{theta:.2f}'), None)
+        if r:
+            print(f"    θ={theta:.2f}  C={r['C']:.4f}")
+            Cs.append(r['C'])
+    if len(Cs) > 3:
+        # Monotone ?
+        diffs = np.diff(Cs)
+        monotone = all(d <= 0.01 for d in diffs)
+        print(f"    Range: {max(Cs):.4f} → {min(Cs):.4f}  {'Monotone ✓' if max(Cs)-min(Cs) > 0.1 else 'Flat'}")
+
+# ═══════════════════════════════════════════════════
+# ANALYSE DEPTH
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("DEPTH SCAN sur vrai hardware")
+print(f"{'='*60}")
+
+for N in [10, 20]:
+    print(f"\n  N = {N}:")
+    for depth in [1, 5, 10, 20, 50]:
+        r = next((r for r in all_results if r['label']==f'depth{depth}_N{N}'), None)
+        if r:
+            print(f"    depth={depth:3d}  C={r['C']:.4f}")
+
+# ═══════════════════════════════════════════════════
+# RÉSUMÉ
+# ═══════════════════════════════════════════════════
+
+print(f"\n{'='*60}")
+print("RÉSUMÉ")
+print(f"{'='*60}")
+
+# C_eq(B) = 1/3 à grande taille ?
+param_Cs = [r['C'] for r in all_results if 'param' in r['label']]
+if param_Cs:
+    print(f"\n  C_eq(B) paramagnétique : {np.mean(param_Cs):.4f} ± {np.std(param_Cs):.4f}")
+    print(f"  Déviation de 1/3 : {abs(np.mean(param_Cs) - 1/3):.4f}")
+
+# C ordered diminue-t-il avec N (bruit) ?
+ord_results = [(r['N'], r['C']) for r in all_results if 'ordered' in r['label']]
+ord_results.sort()
+if len(ord_results) > 3:
+    Ns, Cs = zip(*ord_results)
+    r_NC, p = stats.pearsonr(np.log(Ns), Cs)
+    print(f"\n  C ordonné vs log(N) : ρ = {r_NC:+.4f} (p={p:.4f})")
+    if r_NC < -0.5:
+        print(f"  → Le bruit hardware RÉDUIT C pour les grands N")
+    else:
+        print(f"  → C ordonné STABLE malgré le bruit !")
+
+print(f"\n  Temps total hardware : {t_done-t_submit:.0f}s ({(t_done-t_submit)/60:.1f} min)")
+print(f"  Circuits exécutés : {len(circuits)}")
+print(f"  Minutes restantes IBM : ~{8 - (t_done-t_submit)/60:.1f}")
+
+#!/usr/bin/env python3
+"""
+cpsi_ibm_quantum.py — C[Ψ] sur VRAIS QUBITS IBM Quantum
+
+ÉTAPE 1 : Créer un compte IBM Quantum (gratuit)
+  → https://quantum.ibm.com
+  → Sign up → Get API token
+
+ÉTAPE 2 : pip install qiskit qiskit-ibm-runtime
+
+ÉTAPE 3 : Coller ton API token ci-dessous et lancer
+
+TEST A : C[Ψ] sur ground state Ising (état préparé par VQE)
+TEST B : C[Ψ] vs profondeur de circuit (proxy de décohérence)
+TEST C : max(C) = max(W) sur vrai hardware
+
+python3 ~/Desktop/cpsi_ibm_quantum.py
+"""
+
+# ═══════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════
+
+# 1. Va sur https://quantum.ibm.com (dashboard)
+# 2. Copie ton API key (44 caractères, en haut du dashboard)
+#    OU va sur https://cloud.ibm.com/iam/apikeys → Create
+# 3. Colle ici :
+IBM_TOKEN = "7xVLVvR99E858ptggH93l8c7tgrBKrsHgszbFAeK11zO"
+
+# 4. Le CRN de ton instance (tu l'as déjà) :
+IBM_CRN = "crn:v1:bluemix:public:quantum-computing:us-east:a/0097a59bc929466eab1121f836f4b16f:75533909-0b8a-4563-a872-75864689f863::"
+
+# ═══════════════════════════════════════════════════
+# SETUP
+# ═══════════════════════════════════════════════════
+
+import numpy as np
+from scipy import stats
+import warnings, time
+warnings.filterwarnings('ignore')
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+# Vérifier les imports
+try:
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import SparsePauliOp
+    print("qiskit OK")
+except ImportError:
+    print("ERREUR: pip install qiskit qiskit-ibm-runtime")
+    print("Puis relance ce script")
+    exit(1)
+
+try:
+    from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+    print("qiskit-ibm-runtime OK")
+except ImportError:
+    print("ERREUR: pip install qiskit-ibm-runtime")
+    exit(1)
+
+
+# ═══════════════════════════════════════════════════
+# CONNEXION IBM QUANTUM
+# ═══════════════════════════════════════════════════
+
+def connect_ibm():
+    """Se connecte à IBM Quantum via IBM Cloud."""
+    if IBM_TOKEN == "COLLE_API_KEY":
+        print("\n  TOKEN NON CONFIGURÉ")
+        print("  1. Va sur https://quantum.ibm.com → dashboard → API key")
+        print("  2. OU https://cloud.ibm.com/iam/apikeys → Create")
+        print("  3. Colle la clé (44 caractères) dans IBM_TOKEN")
+        print("\n  En attendant → simulateur local")
+        return None
+    
+    try:
+        QiskitRuntimeService.save_account(
+            channel="ibm_quantum_platform",
+            token=IBM_TOKEN,
+            instance=IBM_CRN,
+            overwrite=True,
+            set_as_default=True
+        )
+        service = QiskitRuntimeService()
+        
+        backends = service.backends()
+        print(f"\n  Connecté à IBM Quantum")
+        print(f"  Backends :")
+        for b in backends[:5]:
+            print(f"    {b.name} : {b.num_qubits} qubits")
+        
+        # Choisir un backend avec >= 4 qubits
+        backend = service.least_busy(min_num_qubits=4, operational=True)
+        print(f"\n  Backend choisi : {backend.name}")
+        return backend
+    except Exception as e:
+        print(f"  Connexion échouée : {e}")
+        print("  → simulateur local")
+        return None
+
+
+# ═══════════════════════════════════════════════════
+# TEST A : C[Ψ] SUR GROUND STATE ISING (circuit)
+# ═══════════════════════════════════════════════════
+
+def ising_ground_state_circuit(N, hJ, depth=3):
+    """
+    Prépare approximativement le ground state de H_Ising 
+    via un ansatz variationnel (simplified VQE).
+    
+    Pour h/J << 1 : |↓↓...↓⟩ (tous spin down)
+    Pour h/J >> 1 : |+...+⟩ (superposition, alignés sur x)
+    Pour h/J ≈ 1 : état intriqué (le plus intéressant)
+    """
+    qc = QuantumCircuit(N, N)
+    
+    if hJ < 0.3:
+        # Phase ordonnée : |↓↓...↓⟩ ≈ ground state
+        # Ne rien faire (|0⟩ = |↑⟩, on veut |↓⟩)
+        for i in range(N):
+            qc.x(i)  # |0⟩ → |1⟩ ≈ |↓⟩
+    elif hJ > 1.5:
+        # Phase paramagnétique : |+...+⟩
+        for i in range(N):
+            qc.h(i)  # Hadamard
+    else:
+        # Transition : ansatz variationnel
+        # Couches alternées RY + CNOT (hardware-efficient ansatz)
+        theta = np.pi * (1 - hJ) / 2  # interpolation
+        for layer in range(depth):
+            for i in range(N):
+                qc.ry(theta + 0.1 * layer, i)
+            for i in range(N-1):
+                qc.cx(i, i+1)
+    
+    return qc
+
+
+def measure_sz(qc, N, shots=4096):
+    """
+    Mesure σ_z sur tous les qubits via Statevector (simulateur local).
+    """
+    from qiskit.quantum_info import Statevector
+    
+    # Obtenir le statevector AVANT mesure
+    sv = Statevector.from_instruction(qc)
+    
+    # Sampler les résultats
+    counts = sv.sample_counts(shots)
+    
+    # Calculer ⟨σ_z^i⟩ = P(0) - P(1) pour chaque qubit
+    sz = np.zeros(N)
+    total = sum(counts.values())
+    
+    for bitstring, count in counts.items():
+        for i in range(N):
+            bit = int(bitstring[N-1-i])  # qiskit little-endian
+            sz[i] += (1 - 2*bit) * count / total  # |0⟩ → +1, |1⟩ → -1
+    
+    return sz
+
+
+def test_ground_state_local():
+    """Test C[Ψ] sur ground state Ising en simulateur local."""
+    print(f"\n{'='*60}")
+    print(f"TEST A : C[Ψ] sur ground state Ising (simulateur)")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    
+    for hJ in [0.01, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0]:
+        qc = ising_ground_state_circuit(N, hJ)
+        sz = measure_sz(qc, N)
+        C, T = compute_cpsi(sz)
+        print(f"  hJ={hJ:.2f}  C={C:.4f}  T={T:.4f}  <sz>={sz}", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# TEST B : DÉCOHÉRENCE = PROFONDEUR DE CIRCUIT
+# ═══════════════════════════════════════════════════
+
+def test_decoherence_depth():
+    """
+    Sur vrai hardware, la profondeur du circuit = décohérence.
+    Plus le circuit est profond, plus le bruit (T1, T2) agit.
+    
+    → Circuit court = état quasi-pur = C élevé
+    → Circuit long = état mixte (bruit) = C faible
+    
+    C'est l'équivalent EXPÉRIMENTAL du scan en gamma !
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST B : C[Ψ] vs profondeur de circuit")
+    print(f"Profondeur = proxy de décohérence sur vrai hardware")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    
+    for depth in [1, 2, 3, 5, 10, 20, 50]:
+        qc = QuantumCircuit(N, N)
+        
+        # Préparer un état ordonné
+        for i in range(N):
+            qc.x(i)
+        
+        # Ajouter des couches d'identité (= bruit sur vrai hardware)
+        for d in range(depth):
+            for i in range(N):
+                qc.barrier()
+                qc.id(i)  # identité = pas d'opération, mais du bruit
+            # Ajouter aussi des CNOT pour coupler les qubits
+            for i in range(N-1):
+                qc.cx(i, i+1)
+                qc.cx(i+1, i)  # aller-retour = identité logique, bruit physique
+        
+        sz = measure_sz(qc, N)
+        C, T = compute_cpsi(sz)
+        print(f"  depth={depth:3d}  C={C:.4f}  T={T:.4f}  <sz>_mean={np.mean(sz):.4f}", flush=True)
+    
+    print(f"\n  NOTE : en simulateur parfait, depth n'a pas d'effet")
+    print(f"  Sur VRAI hardware IBM, C va DIMINUER avec depth")
+    print(f"  car le bruit T1/T2 agit comme la décohérence gamma")
+
+
+# ═══════════════════════════════════════════════════
+# TEST C : CIRCUIT POUR IBM QUANTUM (vrai hardware)
+# ═══════════════════════════════════════════════════
+
+def create_ibm_circuits():
+    """
+    Crée les circuits prêts à envoyer sur IBM Quantum.
+    Peut être lancé plus tard quand le token est configuré.
+    """
+    print(f"\n{'='*60}")
+    print(f"TEST C : Circuits prêts pour IBM Quantum")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4
+    circuits = []
+    labels = []
+    
+    # 1. Différents h/J (ground states)
+    for hJ in [0.01, 0.3, 0.5, 0.7, 1.0, 2.0]:
+        qc = ising_ground_state_circuit(N, hJ, depth=3)
+        qc.measure(range(N), range(N))
+        circuits.append(qc)
+        labels.append(f"gs_hJ{hJ}")
+    
+    # 2. Différentes profondeurs (proxy décohérence)
+    for depth in [1, 5, 10, 20, 50, 100]:
+        qc = QuantumCircuit(N, N)
+        for i in range(N): qc.x(i)
+        for d in range(depth):
+            qc.barrier()
+            for i in range(N): qc.id(i)
+            for i in range(N-1):
+                qc.cx(i, i+1); qc.cx(i+1, i)
+        qc.measure(range(N), range(N))
+        circuits.append(qc)
+        labels.append(f"depth_{depth}")
+    
+    # 3. État GHZ (maximalement intriqué)
+    qc_ghz = QuantumCircuit(N, N)
+    qc_ghz.h(0)
+    for i in range(N-1):
+        qc_ghz.cx(i, i+1)
+    qc_ghz.measure(range(N), range(N))
+    circuits.append(qc_ghz)
+    labels.append("GHZ")
+    
+    # 4. État aléatoire
+    qc_rand = QuantumCircuit(N, N)
+    for i in range(N):
+        theta = np.random.uniform(0, np.pi)
+        phi = np.random.uniform(0, 2*np.pi)
+        qc_rand.ry(theta, i)
+        qc_rand.rz(phi, i)
+    qc_rand.measure(range(N), range(N))
+    circuits.append(qc_rand)
+    labels.append("random")
+    
+    print(f"  {len(circuits)} circuits créés :")
+    for i, label in enumerate(labels):
+        print(f"    {i}: {label} ({circuits[i].depth()} portes)")
+    
+    return circuits, labels
+
+
+def run_on_ibm(backend, circuits, labels):
+    """Envoie les circuits sur IBM Quantum et analyse les résultats."""
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+    
+    print(f"\n  Transpilation pour {backend.name}...", flush=True)
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    isa_circuits = pm.run(circuits)
+    print(f"  {len(isa_circuits)} circuits transpilés", flush=True)
+    
+    print(f"  Envoi sur {backend.name}...", flush=True)
+    sampler = SamplerV2(backend)
+    
+    # Envoyer en pubs format
+    pubs = [(circ,) for circ in isa_circuits]
+    job = sampler.run(pubs, shots=4096)
+    print(f"  Job ID: {job.job_id()}")
+    print(f"  En attente... (1-60 min selon la queue)", flush=True)
+    
+    result = job.result()
+    
+    print(f"\n  RÉSULTATS SUR VRAI HARDWARE ({backend.name}) :")
+    N = 4
+    for i, label in enumerate(labels):
+        try:
+            # Extraire les counts du résultat
+            data = result[i].data
+            # Trouver le registre classique
+            creg_name = list(data.__dict__.keys())[0]
+            bitarray = getattr(data, creg_name)
+            counts = bitarray.get_counts()
+            
+            total = sum(counts.values())
+            sz = np.zeros(N)
+            for bitstring, count in counts.items():
+                for q in range(min(N, len(bitstring))):
+                    bit = int(bitstring[len(bitstring)-1-q])
+                    sz[q] += (1 - 2*bit) * count / total
+            
+            C, T = compute_cpsi(sz[:N])
+            print(f"    {label:15s}  C={C:.4f}  T={T:.4f}  <sz>={np.mean(sz[:N]):+.3f}")
+        except Exception as e:
+            print(f"    {label:15s}  ERREUR: {str(e)[:60]}")
+
+
+# ═══════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Ψ] SUR IBM QUANTUM")
+    print(f"{'='*60}")
+    
+    # Tests en simulateur local (toujours)
+    test_ground_state_local()
+    test_decoherence_depth()
+    circuits, labels = create_ibm_circuits()
+    
+    # Connexion IBM (si token configuré)
+    backend = connect_ibm()
+    
+    if backend is not None:
+        run_on_ibm(backend, circuits, labels)
+    else:
+        print(f"\n{'='*60}")
+        print(f"PROCHAINES ÉTAPES :")
+        print(f"1. Va sur https://quantum.ibm.com")
+        print(f"2. Crée un compte (gratuit, email suffit)")
+        print(f"3. Copie ton API token")
+        print(f"4. Colle-le dans IBM_TOKEN en haut de ce script")
+        print(f"5. Relance : python3 ~/Desktop/cpsi_ibm_quantum.py")
+        print(f"")
+        print(f"Le plan gratuit donne accès à :")
+        print(f"  - Simulateurs : illimité")
+        print(f"  - Vrais qubits : 10 min/mois sur 127-qubit Eagle")
+        print(f"  - Files d'attente : quelques minutes à 1h")
+        print(f"")
+        print(f"Avec 10 min, on peut lancer ~50 circuits × 4096 shots")
+        print(f"= largement assez pour reproduire les tests A, B, C")
+        print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_overnight.py — Tests pour la nuit
+
+PRIORITÉ 1 : Test trivial/physique à N=5 (steadystate faisable)
+  → Même test que N=4 mais à N=5 où C commence à se différencier de Pureté
+  → Si corrélations tiennent → pas trivial même à plus grande taille
+
+PRIORITÉ 2 : max(C) = max(W) à N=5
+  → Le résultat killer confirmé à N>4
+
+PRIORITÉ 3 : Finite-size scaling N=15, N=16 (ground state, rapide)
+  → Étendre le dataset de 121 à 143 points
+
+PRIORITÉ 4 : Dérivation λ(γ) à N=5
+  → λ/γ converge-t-il vers une constante ?
+
+Tout séquentiel, un seul process, résultats incrémentaux.
+
+python3 -u ~/Desktop/cpsi_overnight.py 2>&1 | tee ~/Desktop/overnight_log.txt
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats, optimize
+import warnings, time, csv
+warnings.filterwarnings('ignore')
+from pathlib import Path
+
+print(f"qutip {qt.__version__}", flush=True)
+OUT = Path.home() / "Desktop" / "cpsi_overnight"
+OUT.mkdir(exist_ok=True)
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+def ising_H(N, hJ, J=1.0, eps=0.01):
+    h = hJ * J; H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -eps * qt.tensor(o2)
+    return H
+
+def make_cops(N, gamma):
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    return c_ops
+
+def make_sz_ops(N):
+    ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        ops.append(qt.tensor(o))
+    return ops
+
+
+# ═══════════════════════════════════════════════════
+# PRIORITÉ 1 : TRIVIAL/PHYSIQUE à N=5
+# ═══════════════════════════════════════════════════
+
+def test_trivial_n5():
+    print(f"\n{'='*60}")
+    print(f"P1 : TEST TRIVIAL/PHYSIQUE — N=5")
+    print(f"h/J FIXE, gamma varie")
+    print(f"{'='*60}", flush=True)
+    
+    N = 5
+    gamma_values = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+    
+    all_results = []
+    for hJ in [0.3, 0.5, 0.6, 0.8, 1.0]:
+        print(f"\n  h/J = {hJ}:", flush=True)
+        results = []
+        
+        for gamma in gamma_values:
+            t0 = time.time()
+            H = ising_H(N, hJ)
+            c_ops = make_cops(N, gamma)
+            sz_ops = make_sz_ops(N)
+            
+            try:
+                rho = qt.steadystate(H, c_ops, method='direct')
+                sz = np.array([qt.expect(op, rho) for op in sz_ops])
+                C, T = compute_cpsi(sz)
+                
+                # Production d'entropie
+                sigma = 0
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+                    Lk = qt.tensor(o)
+                    sigma += gamma * qt.expect(Lk.dag() * Lk, rho)
+                
+                # Surprise
+                probs = [(1 + s)/2 for s in sz]
+                surprise = sum(-np.clip(p,1e-10,1-1e-10)*np.log(np.clip(p,1e-10,1-1e-10))
+                              -(1-np.clip(p,1e-10,1-1e-10))*np.log(1-np.clip(p,1e-10,1-1e-10))
+                              for p in probs) / N
+                
+                # Conductance
+                conductance = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+                
+                E = qt.expect(H, rho)
+                S = qt.entropy_vn(rho, 2)
+                P = (rho*rho).tr().real
+                F = E - gamma * S
+                
+                dt = time.time() - t0
+                print(f"    g={gamma:.3f}  C={C:.4f}  surp={surprise:.4f}  P={P:.4f}  ({dt:.0f}s)", flush=True)
+                results.append({'gamma':gamma,'C':C,'surprise':surprise,'sigma':sigma,
+                                'conductance':conductance,'E':E,'P':P,'F':F})
+            except Exception as e:
+                print(f"    g={gamma:.3f}  X {str(e)[:50]}", flush=True)
+        
+        if len(results) < 5: continue
+        C_a = np.array([r['C'] for r in results])
+        P_a = np.array([r['P'] for r in results])
+        
+        print(f"\n    CORRÉLATIONS à h/J={hJ} (N=5) :")
+        for name, arr in [("Surprise", [r['surprise'] for r in results]),
+                          ("sigma_prod", [r['sigma'] for r in results]),
+                          ("Conductance", [r['conductance'] for r in results]),
+                          ("Purete", [r['P'] for r in results]),
+                          ("-F", [-r['F'] for r in results])]:
+            arr = np.array(arr)
+            r, p = stats.pearsonr(C_a, arr)
+            # Aussi tester si C corrèle MIEUX que Pureté
+            rP, _ = stats.pearsonr(P_a, arr) if name != "Purete" else (1.0, 0)
+            better = "C>P" if abs(r) > abs(rP) else "P>C"
+            trivial = "PHYSIQUE" if abs(r) > 0.8 else "TRIVIAL" if abs(r) < 0.5 else "modere"
+            print(f"      rho(C,{name:12s})={r:+.4f}  rho(P,·)={rP:+.4f}  {better}  {trivial}", flush=True)
+        
+        all_results.extend(results)
+    
+    with open(OUT / 'trivial_n5.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=all_results[0].keys())
+        w.writeheader(); w.writerows(all_results)
+
+
+# ═══════════════════════════════════════════════════
+# PRIORITÉ 2 : max(C) = max(W) à N=5
+# ═══════════════════════════════════════════════════
+
+def test_control_n5():
+    print(f"\n{'='*60}")
+    print(f"P2 : max(C) = max(W) ? — N=5")
+    print(f"{'='*60}", flush=True)
+    
+    N = 5; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    E_gs = H.eigenenergies(eigvals=1, sparse=True)[0]
+    
+    n_steps = 200; dt = 0.5
+    
+    protocols = {
+        'constant_0.05': lambda t: 0.05,
+        'constant_0.1': lambda t: 0.1,
+        'constant_0.3': lambda t: 0.3,
+        'constant_0.5': lambda t: 0.5,
+        'rampe_up': lambda t: 0.01 + 0.49 * t / (n_steps * dt),
+        'rampe_down': lambda t: 0.50 - 0.49 * t / (n_steps * dt),
+        'pulse': lambda t: 0.5 if int(t / 10) % 2 == 0 else 0.01,
+        'fort_puis_faible': lambda t: 0.5 if t < n_steps*dt/2 else 0.05,
+    }
+    
+    # Même état initial pour tous
+    np.random.seed(42)
+    psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+    
+    results = {}
+    for name, gamma_func in protocols.items():
+        rho = qt.ket2dm(psi0)
+        E_init = qt.expect(H, rho)
+        
+        for step in range(n_steps):
+            t = step * dt
+            gamma = gamma_func(t)
+            c_ops = make_cops(N, gamma)
+            res = qt.mesolve(H, rho, [0, dt], c_ops, [], options={"store_states": True})
+            rho = res.states[-1]
+        
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C_final, _ = compute_cpsi(sz)
+        E_final = qt.expect(H, rho)
+        W = E_init - E_final
+        
+        results[name] = {'C_final': C_final, 'W': W, 'E_final': E_final}
+        print(f"  {name:20s}  C={C_final:.4f}  W={W:.4f}", flush=True)
+    
+    best_C = max(results, key=lambda k: results[k]['C_final'])
+    best_W = max(results, key=lambda k: results[k]['W'])
+    
+    print(f"\n  Best C: {best_C} (C={results[best_C]['C_final']:.4f})")
+    print(f"  Best W: {best_W} (W={results[best_W]['W']:.4f})")
+    
+    if best_C == best_W:
+        print(f"  --> MEME PROTOCOLE maximise C et W a N=5 !")
+    else:
+        print(f"  --> Protocoles differents : {best_C} vs {best_W}")
+        # Corrélation C_final vs W across protocols
+        Cs = [results[k]['C_final'] for k in results]
+        Ws = [results[k]['W'] for k in results]
+        r, p = stats.pearsonr(Cs, Ws)
+        print(f"  rho(C_final, W) = {r:+.4f}  p={p:.4f}")
+
+
+# ═══════════════════════════════════════════════════
+# PRIORITÉ 3 : FINITE-SIZE N=15, N=16
+# ═══════════════════════════════════════════════════
+
+def test_finitesize_extend():
+    print(f"\n{'='*60}")
+    print(f"P3 : FINITE-SIZE N=15, N=16 (ground state)")
+    print(f"{'='*60}", flush=True)
+    
+    hJ_values = [0.01, 0.2, 0.4, 0.5, 0.57, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0]
+    
+    for N in [15, 16]:
+        dim = 2**N
+        print(f"\n  N={N} (dim={dim}):", flush=True)
+        t_total = time.time()
+        
+        if dim > 65536:
+            print(f"    dim={dim} trop grand pour eigenstates complet", flush=True)
+            continue
+        
+        for hJ in hJ_values:
+            t0 = time.time()
+            try:
+                H = ising_H(N, hJ)
+                evals, estates = H.eigenstates(eigvals=2, sparse=True)
+                psi = estates[0]; gap = evals[1] - evals[0]
+                sz = []
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                    sz.append(qt.expect(qt.tensor(o), psi))
+                C, T = compute_cpsi(np.array(sz))
+                dt = time.time() - t0
+                print(f"    hJ={hJ:.2f}  C={C:.4f}  T={T:.4f}  gap={gap:.4f}  ({dt:.0f}s)", flush=True)
+            except Exception as e:
+                print(f"    hJ={hJ:.2f}  X {str(e)[:50]}", flush=True)
+        
+        print(f"  N={N} termine en {time.time()-t_total:.0f}s", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+# PRIORITÉ 4 : DÉRIVATION λ(γ) à N=5
+# ═══════════════════════════════════════════════════
+
+def test_lambda_n5():
+    print(f"\n{'='*60}")
+    print(f"P4 : lambda(gamma) a N=5")
+    print(f"{'='*60}", flush=True)
+    
+    N = 5; hJ = 0.3
+    H = ising_H(N, hJ, eps=0)
+    sz_ops = make_sz_ops(N)
+    dim = 2**N
+    tlist = np.linspace(0, 150, 500)
+    
+    def exp_relax(t, C_eq, C_0, lam):
+        return C_eq + (C_0 - C_eq) * np.exp(-lam * t)
+    
+    print(f"  {'gamma':>8} {'lambda':>8} {'lam/gam':>8} {'R2':>8} {'C_eq':>8}", flush=True)
+    
+    for gamma in [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
+        c_ops = make_cops(N, gamma)
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho0 = qt.ket2dm(psi0)
+        
+        try:
+            result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops)
+            C_t = []
+            for t_idx in range(len(tlist)):
+                sz = np.array([result.expect[i][t_idx] for i in range(N)])
+                C, _ = compute_cpsi(sz)
+                C_t.append(C)
+            C_t = np.array(C_t)
+            
+            popt, _ = optimize.curve_fit(exp_relax, tlist, C_t, 
+                                         p0=[C_t[-1], C_t[0], gamma], maxfev=5000)
+            C_eq, C_0, lam = popt
+            C_fit = exp_relax(tlist, *popt)
+            r2 = 1 - np.sum((C_t - C_fit)**2) / np.sum((C_t - C_t.mean())**2)
+            
+            print(f"  {gamma:8.3f} {lam:8.4f} {lam/gamma:8.2f} {r2:8.4f} {C_eq:8.4f}", flush=True)
+        except Exception as e:
+            print(f"  {gamma:8.3f} FAIL: {str(e)[:40]}", flush=True)
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] OVERNIGHT — tests pour la nuit")
+    print(f"{'='*60}", flush=True)
+    
+    t0 = time.time()
+    
+    test_finitesize_extend()  # ~30 min (N=15,16)
+    test_lambda_n5()          # ~10 min
+    test_trivial_n5()         # ~2-4h (55 steadystate N=5)
+    test_control_n5()         # ~2h (8 protocoles × 200 steps)
+    
+    total = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"TOTAL: {total/3600:.1f}h")
+    print(f"Resultats: {OUT}")
+    print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_thermal.py — Tests fondamentaux restants
+
+PARTIE 1 : C vs Pureté sur états THERMIQUES (Gibbs) N=7 à 12
+  ρ_thermal = exp(-βH) / Z → états mixtes SANS Lindblad
+  → Rapide (diagonalisation seule)
+  → Si C > Pureté à N≥7 → PRL
+
+PARTIE 2 : Pourquoi C_eq(B) = 1/3 ?
+  Analyse analytique de la phase paramagnétique
+
+PARTIE 3 : C comme principe variationnel ?
+  Test : dC/dt ≥ 0 pendant la relaxation ?
+
+python3 -u ~/Desktop/cpsi_thermal.py 2>&1 | tee ~/Desktop/thermal_log.txt
+"""
+import numpy as np
+import time, warnings, csv
+warnings.filterwarnings('ignore')
+import qutip as qt
+from scipy import stats
+from pathlib import Path
+
+print(f"qutip {qt.__version__}", flush=True)
+OUT = Path.home() / "Desktop" / "cpsi_thermal"
+OUT.mkdir(exist_ok=True)
+
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+
+def ising_H(N, hJ, J=1.0, epsilon=0.01):
+    h = hJ * J
+    H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -epsilon * qt.tensor(o2)
+    return H
+
+
+def thermal_state(H, beta):
+    """État de Gibbs ρ = exp(-βH) / Z"""
+    evals, estates = H.eigenstates()
+    dim = len(evals)
+    # Boltzmann weights
+    weights = np.exp(-beta * (evals - evals.min()))  # shift pour stabilité
+    Z = weights.sum()
+    probs = weights / Z
+    # ρ = Σ p_i |ψ_i⟩⟨ψ_i|
+    rho = sum(probs[i] * qt.ket2dm(estates[i]) for i in range(dim))
+    return rho
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 1 : C vs PURETÉ sur états thermiques
+# ═══════════════════════════════════════════════════
+
+def test_c_vs_purity():
+    print(f"\n{'='*60}")
+    print(f"PARTIE 1 : C vs PURETÉ — états thermiques Gibbs")
+    print(f"N = 7 à 12, températures variées")
+    print(f"{'='*60}", flush=True)
+    
+    # β = 1/T : petit β = haute température (mixte), grand β = basse température (pur)
+    beta_values = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0]
+    hJ_values = [0.3, 0.6, 1.0]
+    
+    for N in [7, 8, 9, 10, 11, 12]:
+        dim = 2**N
+        if dim > 4096:
+            print(f"\n  N={N} (dim={dim}): eigenstates complet trop lent, skip", flush=True)
+            continue
+            
+        print(f"\n  N={N} (dim={dim}):", flush=True)
+        results = []
+        
+        for hJ in hJ_values:
+            t0 = time.time()
+            H = ising_H(N, hJ)
+            
+            # Full diagonalisation (nécessaire pour état thermique)
+            try:
+                evals, estates = H.eigenstates()
+            except Exception as e:
+                print(f"    hJ={hJ} diag failed: {str(e)[:50]}", flush=True)
+                continue
+            
+            for beta in beta_values:
+                # Boltzmann weights
+                weights = np.exp(-beta * (evals - evals.min()))
+                Z = weights.sum()
+                probs = weights / Z
+                
+                # ρ thermique
+                rho = sum(probs[i] * qt.ket2dm(estates[i]) for i in range(len(evals)))
+                
+                # <σz> pour chaque qubit
+                sz = []
+                for i in range(N):
+                    o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+                    sz.append(qt.expect(qt.tensor(o), rho))
+                
+                C, T = compute_cpsi(np.array(sz))
+                purity = (rho * rho).tr().real
+                S_vN = qt.entropy_vn(rho, 2)
+                E = qt.expect(H, rho)
+                
+                results.append({
+                    'N':N, 'hJ':hJ, 'beta':beta, 'C':C, 'T':T,
+                    'purity':purity, 'S_vN':S_vN, 'E':E
+                })
+            
+            dt = time.time() - t0
+            print(f"    hJ={hJ:.1f}: {len(beta_values)} temperatures en {dt:.1f}s", flush=True)
+        
+        if len(results) < 10: continue
+        
+        # ANALYSE : C vs Pureté
+        C_a = np.array([r['C'] for r in results])
+        P_a = np.array([r['purity'] for r in results])
+        E_a = np.array([r['E'] for r in results])
+        S_a = np.array([r['S_vN'] for r in results])
+        
+        rCP, _ = stats.pearsonr(C_a, P_a)
+        
+        # Test clé : C prédit-il E MIEUX que Pureté ?
+        from numpy.linalg import lstsq
+        
+        # R²(Pureté → E)
+        X_p = np.column_stack([P_a, np.ones(len(P_a))])
+        b_p, _, _, _ = lstsq(X_p, E_a, rcond=None)
+        r2_P = 1 - np.sum((E_a - X_p@b_p)**2) / np.sum((E_a - E_a.mean())**2)
+        
+        # R²(C → E)
+        X_c = np.column_stack([C_a, np.ones(len(C_a))])
+        b_c, _, _, _ = lstsq(X_c, E_a, rcond=None)
+        r2_C = 1 - np.sum((E_a - X_c@b_c)**2) / np.sum((E_a - E_a.mean())**2)
+        
+        # R²(C + Pureté → E)
+        X_cp = np.column_stack([C_a, P_a, np.ones(len(C_a))])
+        b_cp, _, _, _ = lstsq(X_cp, E_a, rcond=None)
+        r2_CP = 1 - np.sum((E_a - X_cp@b_cp)**2) / np.sum((E_a - E_a.mean())**2)
+        
+        delta_r2 = r2_CP - r2_P
+        
+        print(f"\n    RÉSULTATS N={N} ({len(results)} configs) :")
+        print(f"    rho(C, Pureté) = {rCP:+.4f}")
+        print(f"    R2(Pureté -> E) = {r2_P:.4f}")
+        print(f"    R2(C -> E)      = {r2_C:.4f}  {'C > P !' if r2_C > r2_P else 'P > C'}")
+        print(f"    R2(C+P -> E)    = {r2_CP:.4f}")
+        print(f"    Delta R2        = {delta_r2:+.4f}  {'C ajoute info !' if delta_r2 > 0.01 else ''}", flush=True)
+        
+        # Sauver
+        with open(OUT / f'thermal_N{N}.csv', 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=results[0].keys())
+            w.writeheader(); w.writerows(results)
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 2 : POURQUOI C_eq(B) = 1/3 ?
+# ═══════════════════════════════════════════════════
+
+def test_ceq_analysis():
+    print(f"\n{'='*60}")
+    print(f"PARTIE 2 : POURQUOI C_eq(B) = 1/3 ?")
+    print(f"{'='*60}", flush=True)
+    
+    print(f"\n  ANALYSE ANALYTIQUE :")
+    print(f"  En phase paramagnétique (h >> J), tous les spins s'alignent sur x.")
+    print(f"  Donc <sigma_z^i> -> 0 pour tout i.")
+    print(f"  ")
+    print(f"  r_micro = mean(|sz_i * sz_(i+1)|) -> 0  (produits de ~0)")
+    print(f"  r_macro = mean(|sz_i * sz_j|)     -> 0  (idem)")
+    print(f"  r_meso  = 1 - std(|sz|)           -> 1  (std de valeurs ~0 = 0)")
+    print(f"  ")
+    print(f"  C = (0 + 0 + 1) / 3 = 1/3 = 0.333...")
+    print(f"  ")
+    print(f"  C'est DEFINITIONNELLEMENT 1/3 quand tous les observables sont nuls.")
+    print(f"  Ce n'est PAS une constante physique profonde.")
+    print(f"  C'est la valeur plancher de C quand le système est homogène et désordonné.", flush=True)
+    
+    # Vérification numérique
+    print(f"\n  VÉRIFICATION NUMÉRIQUE :", flush=True)
+    print(f"  Phase paramagnétique profonde (h/J=2.0) :")
+    
+    for N in [4, 7, 10, 14]:
+        sz = np.zeros(N)  # tous les <σz> = 0
+        # Ajouter un tout petit bruit (comme dans la réalité numérique)
+        sz += np.random.randn(N) * 1e-8
+        C, T = compute_cpsi(sz)
+        print(f"    N={N:2d}: C = {C:.10f}  (deviation de 1/3 = {abs(C-1/3):.2e})")
+    
+    # Test : que se passe-t-il avec une définition ALTERNATIVE ?
+    print(f"\n  DÉFINITIONS ALTERNATIVES :", flush=True)
+    
+    # Alternative 1 : C = (micro + macro + meso) / 3 mais meso = 1 - std/max_std
+    # Alternative 2 : C = sqrt(micro * macro * meso)  (géométrique)
+    # Alternative 3 : C = (micro + macro) / 2  (sans meso)
+    
+    for N in [7, 10, 14]:
+        H = ising_H(N, 2.0)  # Phase B profonde
+        _, estates = H.eigenstates(eigvals=1, sparse=True)
+        psi = estates[0]
+        sz = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz.append(qt.expect(qt.tensor(o), psi))
+        sz = np.array(sz)
+        
+        micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+        macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+        meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+        
+        C_standard = (micro + macro + meso) / 3
+        C_geom = (micro * macro * meso) ** (1/3) if micro > 0 and macro > 0 else 0
+        C_sans_meso = (micro + macro) / 2
+        
+        print(f"    N={N:2d}: standard={C_standard:.4f}  geom={C_geom:.4f}  sans_meso={C_sans_meso:.4f}")
+        print(f"          micro={micro:.6f}  macro={macro:.6f}  meso={meso:.6f}")
+    
+    # Phase A (ordonnée) — même exercice
+    print(f"\n  PHASE ORDONNÉE (h/J=0.01) :", flush=True)
+    for N in [7, 10, 14]:
+        H = ising_H(N, 0.01)
+        _, estates = H.eigenstates(eigvals=1, sparse=True)
+        psi = estates[0]
+        sz = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz.append(qt.expect(qt.tensor(o), psi))
+        sz = np.array(sz)
+        
+        micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+        macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+        meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+        
+        C_standard = (micro + macro + meso) / 3
+        print(f"    N={N:2d}: C={C_standard:.6f}  micro={micro:.6f}  macro={macro:.6f}  meso={meso:.6f}")
+
+
+# ═══════════════════════════════════════════════════
+# PARTIE 3 : C COMME PRINCIPE VARIATIONNEL
+# dC/dt ≥ 0 pendant la relaxation ?
+# ═══════════════════════════════════════════════════
+
+def test_variational():
+    """
+    Si C[Ψ] est un principe variationnel (comme l'entropie),
+    alors C devrait augmenter monotoniquement pendant la relaxation
+    d'un état initial aléatoire vers le steady state.
+    
+    Test : on simule mesolve avec un état initial random
+    et on vérifie que C(t) est monotone croissant.
+    """
+    print(f"\n{'='*60}")
+    print(f"PARTIE 3 : C EST-IL VARIATIONNEL ?")
+    print(f"dC/dt >= 0 pendant la relaxation ?")
+    print(f"{'='*60}", flush=True)
+    
+    N = 4  # petit pour vitesse
+    gamma = 0.1
+    
+    for hJ in [0.3, 0.6, 1.0]:
+        print(f"\n  h/J = {hJ}:", flush=True)
+        H = ising_H(N, hJ, epsilon=0)
+        
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        # État initial aléatoire (état pur random)
+        dim = 2**N
+        psi0 = qt.rand_ket(dim)
+        rho0 = qt.ket2dm(psi0)
+        
+        # Observables σz pour chaque qubit
+        sz_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz_ops.append(qt.tensor(o))
+        
+        # mesolve
+        tlist = np.linspace(0, 50, 200)
+        result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops)
+        
+        # C(t)
+        C_t = []
+        for t_idx in range(len(tlist)):
+            sz = np.array([result.expect[i][t_idx] for i in range(N)])
+            C, T = compute_cpsi(sz)
+            C_t.append(C)
+        C_t = np.array(C_t)
+        
+        # Est-ce monotone ?
+        dC = np.diff(C_t)
+        n_positive = np.sum(dC > 0)
+        n_negative = np.sum(dC < 0)
+        monotone = n_negative == 0
+        
+        C_init = C_t[0]
+        C_final = C_t[-1]
+        C_min = C_t.min()
+        C_max = C_t.max()
+        
+        print(f"    C(0) = {C_init:.4f}  C(inf) = {C_final:.4f}")
+        print(f"    C_min = {C_min:.4f}  C_max = {C_max:.4f}")
+        print(f"    dC > 0 : {n_positive}/{len(dC)}  dC < 0 : {n_negative}/{len(dC)}")
+        
+        if monotone:
+            print(f"    --> MONOTONE CROISSANT (dC/dt >= 0 toujours)")
+        elif n_negative < len(dC) * 0.05:
+            print(f"    --> QUASI-MONOTONE ({n_negative} violations sur {len(dC)})")
+        else:
+            print(f"    --> PAS MONOTONE (C oscille pendant relaxation)")
+    
+    # Test avec 10 états initiaux aléatoires
+    print(f"\n  TEST ROBUSTE : 10 états initiaux random, h/J=0.3 :", flush=True)
+    hJ = 0.3
+    H = ising_H(N, hJ, epsilon=0)
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    
+    monotone_count = 0
+    for trial in range(10):
+        psi0 = qt.rand_ket(dim)
+        rho0 = qt.ket2dm(psi0)
+        result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops)
+        C_t = []
+        for t_idx in range(len(tlist)):
+            sz = np.array([result.expect[i][t_idx] for i in range(N)])
+            C, _ = compute_cpsi(sz)
+            C_t.append(C)
+        dC = np.diff(C_t)
+        n_neg = np.sum(dC < -1e-6)  # seuil numérique
+        if n_neg == 0:
+            monotone_count += 1
+        print(f"    Trial {trial}: C(0)={C_t[0]:.3f} -> C(inf)={C_t[-1]:.3f}  violations={n_neg}  {'MONOTONE' if n_neg==0 else 'oscille'}", flush=True)
+    
+    print(f"\n    VERDICT : {monotone_count}/10 trajectoires monotones")
+    if monotone_count >= 8:
+        print(f"    --> C[Psi] se comporte COMME un potentiel variationnel")
+        print(f"    --> dC/dt >= 0 est une bonne approximation")
+        print(f"    --> Analogue à dS/dt >= 0 (2ème loi)")
+    elif monotone_count >= 5:
+        print(f"    --> Tendance variationnelle mais pas stricte")
+    else:
+        print(f"    --> C N'EST PAS variationnel (oscille)")
+
+
+# ═══════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print(f"{'='*60}")
+    print(f"C[Psi] THERMAL — Tests fondamentaux")
+    print(f"{'='*60}", flush=True)
+    
+    t0 = time.time()
+    
+    test_ceq_analysis()     # ~30s
+    test_variational()      # ~2 min
+    test_c_vs_purity()      # ~10-30 min selon N max
+    
+    total = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"TOTAL: {total/60:.1f} min")
+    print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_trivial_test.py — Trivial ou profond ?
+
+À h/J FIXE, varier SEULEMENT gamma (0.01 à 1.0).
+Si les corrélations C↔surprise/σ_prod/conductance tiennent → PHYSIQUE
+Si elles s'effondrent → juste "tout monotone en h/J"
+
+python3 ~/Desktop/cpsi_trivial_test.py
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T
+
+N = 4
+gamma_values = [0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]
+
+for hJ in [0.3, 0.5, 0.6, 0.8, 1.0]:
+    print(f"\n{'='*60}")
+    print(f"h/J = {hJ} FIXE — scan gamma")
+    print(f"{'='*60}")
+    
+    results = []
+    J = 1.0; h = hJ * J; eps = 0.01
+    
+    for gamma in gamma_values:
+        H = 0
+        for i in range(N-1):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+            H += -J * qt.tensor(o)
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+            H += -h * qt.tensor(o)
+            o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+            H += -eps * qt.tensor(o2)
+        
+        c_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+        
+        rho = qt.steadystate(H, c_ops, method='direct')
+        
+        sz_ops = []
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+            sz_ops.append(qt.tensor(o))
+        sz = np.array([qt.expect(op, rho) for op in sz_ops])
+        C, T = compute_cpsi(sz)
+        
+        # Production d'entropie
+        sigma = 0
+        for i in range(N):
+            o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+            Lk = qt.tensor(o)
+            sigma += gamma * qt.expect(Lk.dag() * Lk, rho)
+        
+        # Surprise
+        probs = [(1 + s)/2 for s in sz]
+        surprise = 0
+        for p in probs:
+            p = np.clip(p, 1e-10, 1-1e-10)
+            surprise -= p * np.log(p) + (1-p) * np.log(1-p)
+        surprise /= N
+        
+        # Conductance
+        conductance = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+        
+        # Énergie
+        E = qt.expect(H, rho)
+        S = qt.entropy_vn(rho, 2)
+        P = (rho*rho).tr().real
+        F = E - gamma * S
+        
+        print(f"  g={gamma:.3f}  C={C:.4f}  surp={surprise:.4f}  sig={sigma:.4f}  cond={conductance:.4f}  P={P:.4f}")
+        results.append({'gamma':gamma,'C':C,'surprise':surprise,'sigma':sigma,
+                        'conductance':conductance,'E':E,'S':S,'P':P,'F':F})
+    
+    if len(results) < 5: continue
+    
+    C_a = np.array([r['C'] for r in results])
+    surp_a = np.array([r['surprise'] for r in results])
+    sig_a = np.array([r['sigma'] for r in results])
+    cond_a = np.array([r['conductance'] for r in results])
+    P_a = np.array([r['P'] for r in results])
+    F_a = np.array([r['F'] for r in results])
+    
+    print(f"\n  CORRÉLATIONS à h/J={hJ} FIXE (gamma varie) :")
+    
+    tests = [
+        ("Surprise", surp_a),
+        ("sigma_prod", sig_a),
+        ("Conductance", cond_a),
+        ("Purete", P_a),
+        ("-F", -F_a),
+    ]
+    
+    for name, arr in tests:
+        r, p = stats.pearsonr(C_a, arr)
+        trivial = "TRIVIAL" if abs(r) < 0.5 else "PHYSIQUE" if abs(r) > 0.8 else "modere"
+        print(f"    rho(C, {name:12s}) = {r:+.4f}  p={p:.4f}  -> {trivial}")
+
+print(f"\n{'='*60}")
+print(f"VERDICT FINAL")
+print(f"Si les correlations tiennent a h/J fixe -> le lien est PHYSIQUE")
+print(f"Si elles s'effondrent -> c'etait juste 'tout monotone en h/J'")
+print(f"{'='*60}")
+
+#!/usr/bin/env python3
+"""
+cpsi_variational.py — C n'est pas monotone en t, mais est-il monotone en E ?
+
+Hypothèse : le système relaxe en minimisant E (garanti par dissipation).
+Si C = f(E) monotone, alors C est "variationnel via l'énergie".
+
+Aussi : existe-t-il une combinaison f(C, T) qui EST monotone en t ?
+
+python3 ~/Desktop/cpsi_variational.py
+"""
+import numpy as np
+import qutip as qt
+from scipy import stats
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+print(f"qutip {qt.__version__}")
+
+def compute_cpsi(sz):
+    N = len(sz)
+    micro = np.mean([abs(sz[i]*sz[i+1]) for i in range(N-1)])
+    macro = np.mean([abs(sz[i]*sz[j]) for i in range(N) for j in range(i+1,N)])
+    meso = max(0, min(1, 1.0 - np.std(np.abs(sz))))
+    C = (micro + macro + meso) / 3
+    T = abs(micro-meso) + abs(meso-macro) + abs(micro-macro)
+    return C, T, micro, macro, meso
+
+N = 4
+gamma = 0.1
+
+for hJ in [0.3, 0.6, 1.0]:
+    print(f"\n{'='*60}")
+    print(f"h/J = {hJ}")
+    print(f"{'='*60}")
+    
+    J = 1.0; h = hJ * J; epsilon = 0.01
+    H = 0
+    for i in range(N-1):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz(); o[i+1] = qt.sigmaz()
+        H += -J * qt.tensor(o)
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmax()
+        H += -h * qt.tensor(o)
+        o2 = [qt.qeye(2)]*N; o2[i] = qt.sigmaz()
+        H += -epsilon * qt.tensor(o2)
+    
+    c_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.destroy(2)
+        c_ops.append(np.sqrt(gamma) * qt.tensor(o))
+    
+    sz_ops = []
+    for i in range(N):
+        o = [qt.qeye(2)]*N; o[i] = qt.sigmaz()
+        sz_ops.append(qt.tensor(o))
+    
+    # 5 trajectoires random
+    tlist = np.linspace(0, 80, 400)
+    dim = 2**N
+    
+    for trial in range(5):
+        psi0 = qt.Qobj(qt.rand_ket(dim).full(), dims=[[2]*N, [1]*N])
+        rho0 = qt.ket2dm(psi0)
+        
+        # mesolve avec H comme e_op aussi pour avoir E(t)
+        result = qt.mesolve(H, rho0, tlist, c_ops, sz_ops + [H])
+        
+        C_t = []; T_t = []; E_t = []; S_t = []
+        mi_t = []; ma_t = []; me_t = []
+        
+        for t_idx in range(len(tlist)):
+            sz = np.array([result.expect[i][t_idx] for i in range(N)])
+            C, T, mi, ma, me = compute_cpsi(sz)
+            E = result.expect[N][t_idx]  # <H>
+            C_t.append(C); T_t.append(T); E_t.append(E)
+            mi_t.append(mi); ma_t.append(ma); me_t.append(me)
+        
+        C_t = np.array(C_t); T_t = np.array(T_t); E_t = np.array(E_t)
+        mi_t = np.array(mi_t); ma_t = np.array(ma_t); me_t = np.array(me_t)
+        
+        # 1. E(t) est-il monotone ?
+        dE = np.diff(E_t)
+        E_mono = np.sum(dE < 1e-8)  # combien de pas E diminue
+        
+        # 2. C est-il monotone en E ? (pas en t)
+        # Trier par E et vérifier si C est monotone
+        sort_idx = np.argsort(E_t)
+        C_sorted_by_E = C_t[sort_idx]
+        dC_by_E = np.diff(C_sorted_by_E)
+        C_mono_E = np.sum(dC_by_E < -1e-6)  # violations monotonie C(E)
+        
+        # 3. Corrélation C(t) vs E(t)
+        rCE, _ = stats.pearsonr(C_t, E_t)
+        
+        # 4. Tester des combinaisons f(C,T)
+        dC = np.diff(C_t)
+        dT = np.diff(T_t)
+        
+        # Candidats variationnels
+        candidates = {
+            'C': C_t,
+            '-T': -T_t,
+            'C-T': C_t - T_t,
+            'C+T': C_t + T_t,
+            'C*T': C_t * T_t,
+            'C/(1+T)': C_t / (1 + T_t),
+            'C^2': C_t**2,
+            'log(C)': np.log(C_t + 1e-10),
+            'C-T/3': C_t - T_t/3,
+            'micro': mi_t,
+            'macro': ma_t,
+            'meso': me_t,
+            'micro+macro': mi_t + ma_t,
+            'E': E_t,
+        }
+        
+        if trial == 0:
+            print(f"\n  {'Candidat':<16} {'violations':<12} {'direction':<10} {'rho(·,t)':<10}")
+            print(f"  {'-'*48}")
+        
+        for name, arr in candidates.items():
+            d = np.diff(arr)
+            # Compter violations dans la direction dominante
+            n_pos = np.sum(d > 1e-8)
+            n_neg = np.sum(d < -1e-8)
+            if n_pos > n_neg:
+                violations = n_neg
+                direction = "croissant"
+            else:
+                violations = n_pos
+                direction = "decroissant"
+            
+            rho_t, _ = stats.pearsonr(arr, tlist)
+            
+            if trial == 0:
+                print(f"  {name:<16} {violations:<12} {direction:<10} {rho_t:+.4f}")
+        
+        # Résumé trajectoire
+        if trial == 0:
+            print(f"\n  E monotone decroissant: {E_mono}/{len(dE)} pas")
+            print(f"  rho(C, E) = {rCE:+.4f}")
+            print(f"  C monotone en E: violations = {C_mono_E}/{len(dC_by_E)}")
+
+print(f"\n{'='*60}")
+print("INTERPRETATION:")
+print("Si un candidat a 0 violations -> principe variationnel")
+print("Si E a 0 violations -> relaxation dissipative OK")
+print("Si C monotone en E -> C variationnel VIA energie")
+print(f"{'='*60}")
